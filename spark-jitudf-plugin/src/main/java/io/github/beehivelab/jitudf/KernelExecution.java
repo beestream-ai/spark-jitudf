@@ -75,19 +75,19 @@ final class KernelExecution implements AutoCloseable {
         // capacity is sized for the worst case the kernel could index -- see listValueCapacity.
         for (InputSpec input : descriptor.inputs()) {
             if (input.isList()) {
-                TornadoNativeArray offsets = deviceView(PrimitiveKind.INT, numRows + 1);
-                TornadoNativeArray values = deviceView(input.kind(), listValueCapacity);
+                TornadoNativeArray offsets = cudaDeviceView(PrimitiveKind.INT, numRows + 1);
+                TornadoNativeArray values = cudaDeviceView(input.kind(), listValueCapacity);
                 inputViews.add(offsets);
                 inputViews.add(values);
                 taskArguments.add(offsets);
                 taskArguments.add(values);
             } else {
-                TornadoNativeArray view = deviceView(input.kind(), numRows);
+                TornadoNativeArray view = cudaDeviceView(input.kind(), numRows);
                 inputViews.add(view);
                 taskArguments.add(view);
             }
         }
-        this.outputView = deviceView(descriptor.outputKind(), numRows);
+        this.outputView = cudaDeviceView(descriptor.outputKind(), numRows);
         taskArguments.add(outputView);
         taskArguments.add(numRows);
 
@@ -122,12 +122,12 @@ final class KernelExecution implements AutoCloseable {
         throw new IllegalStateException("the generated class " + kernelClass.getName() + " has no " + descriptor.kernelMethodName() + " method");
     }
 
-    private static TornadoNativeArray deviceView(PrimitiveKind kind, long rows) {
+    private static TornadoNativeArray cudaDeviceView(PrimitiveKind kind, long rows) {
         return switch (kind) {
-            case INT -> IntArray.deviceView(rows);
-            case LONG -> LongArray.deviceView(rows);
-            case FLOAT -> FloatArray.deviceView(rows);
-            case DOUBLE -> DoubleArray.deviceView(rows);
+            case INT -> IntArray.cudaDeviceView(rows);
+            case LONG -> LongArray.cudaDeviceView(rows);
+            case FLOAT -> FloatArray.cudaDeviceView(rows);
+            case DOUBLE -> DoubleArray.cudaDeviceView(rows);
         };
     }
 
@@ -162,17 +162,17 @@ final class KernelExecution implements AutoCloseable {
         try {
             for (int i = 0; i < inputs.size(); i++) {
                 CudfBufferAdapter.InputBinding input = inputs.get(i);
-                plan.bindExternalBuffer(inputViews.get(i), input.address(), input.byteLength(), input.rows(), -1, true);
+                plan.bindCUDADeviceBuffer(inputViews.get(i), input.address(), input.byteLength(), input.rows(), -1, true);
                 boundSoFar++;
             }
-            plan.bindExternalBuffer(outputView, outputAddress, outputByteLength, numRows, -1, false);
+            plan.bindCUDADeviceBuffer(outputView, outputAddress, outputByteLength, numRows, -1, false);
         } catch (RuntimeException e) {
             // Binding is all or nothing. A view left bound by a half-finished attempt keeps an
             // address the caller is about to release, and the ownership token with it, so the next
             // batch cannot bind that view at all.
             for (int i = 0; i < boundSoFar; i++) {
                 try {
-                    plan.unbindExternalBuffer(inputViews.get(i));
+                    plan.unbindCUDADeviceBuffer(inputViews.get(i));
                 } catch (RuntimeException ignored) {
                     // Keep unwinding; the original failure is the one worth reporting.
                 }
@@ -187,9 +187,9 @@ final class KernelExecution implements AutoCloseable {
             return;
         }
         for (TornadoNativeArray view : inputViews) {
-            plan.unbindExternalBuffer(view);
+            plan.unbindCUDADeviceBuffer(view);
         }
-        plan.unbindExternalBuffer(outputView);
+        plan.unbindCUDADeviceBuffer(outputView);
         bound = false;
     }
 
