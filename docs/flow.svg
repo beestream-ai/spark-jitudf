@@ -1,0 +1,99 @@
+    <svg viewBox="0 0 1000 968" role="img"
+         aria-label="Compiler-selection flow. A Spark JVM UDF goes to the RAPIDS udf-compiler. If compilation succeeds it becomes Catalyst expressions and RAPIDS executes them on the GPU. If it fails, structured rejection diagnostics are produced and asked whether TornadoVM could support the UDF; if not, the existing CPU fallback is used. If so, TornadoVM eligibility and ASM analysis run; if the UDF cannot be transformed and compiled it also goes to the CPU fallback, otherwise a parallel wrapper is generated, a dynamic task graph built, the kernel JIT-compiled and executed on the GPU, and a cuDF output column returned. Both GPU paths rejoin to continue the query."
+         style="font-family: var(--display); color: var(--fg)">
+      <defs>
+        <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <g font-size="13" fill="currentColor" text-anchor="middle">
+        <!-- A -->
+        <rect x="180" y="30" width="240" height="44" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="58">Spark JVM UDF</text>
+        <!-- B -->
+        <rect x="180" y="104" width="240" height="44" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="132">RAPIDS udf-compiler</text>
+        <!-- C decision -->
+        <polygon points="300,178 430,209 300,240 170,209" fill="var(--surface-2)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="213" font-size="12.5">Compilation successful?</text>
+        <!-- D -->
+        <rect x="620" y="178" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="740" y="206">Catalyst expressions</text>
+        <!-- E -->
+        <rect x="620" y="252" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="740" y="274" font-size="12.5">RAPIDS GPU eligibility</text>
+        <text x="740" y="289" font-size="12.5">and execution</text>
+        <!-- F -->
+        <rect x="180" y="270" width="240" height="44" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="292" font-size="12.5">Structured rejection</text>
+        <text x="300" y="307" font-size="12.5">diagnostics</text>
+        <!-- G decision -->
+        <polygon points="300,344 430,375 300,406 170,375" fill="var(--surface-2)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="371" font-size="12.5">Potentially supported</text>
+        <text x="300" y="386" font-size="12.5">by TornadoVM?</text>
+        <!-- H fallback -->
+        <rect x="18" y="436" width="162" height="44" rx="7" fill="var(--surface)" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="99" y="458" font-size="12.5">Existing CPU</text>
+        <text x="99" y="473" font-size="12.5">fallback</text>
+        <!-- I -->
+        <rect x="180" y="436" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--s3)" stroke-width="1.8"/>
+        <text x="300" y="458" font-size="12.5">TornadoVM eligibility</text>
+        <text x="300" y="473" font-size="12.5">+ ASM analysis</text>
+        <!-- J decision -->
+        <polygon points="300,510 430,541 300,572 170,541" fill="var(--surface-2)" stroke="currentColor" stroke-opacity="0.55"/>
+        <text x="300" y="537" font-size="12.5">Can transform</text>
+        <text x="300" y="552" font-size="12.5">and compile?</text>
+        <!-- K L M N -->
+        <rect x="180" y="602" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--s3)" stroke-width="1.8"/>
+        <text x="300" y="630">Generate parallel wrapper</text>
+        <rect x="180" y="676" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--s3)" stroke-width="1.8"/>
+        <text x="300" y="704">Dynamic TaskGraph</text>
+        <rect x="180" y="750" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--s3)" stroke-width="1.8"/>
+        <text x="300" y="772" font-size="12.5">TornadoVM JIT</text>
+        <text x="300" y="787" font-size="12.5">GPU execution</text>
+        <rect x="180" y="824" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="300" y="846" font-size="12.5">Return cuDF</text>
+        <text x="300" y="861" font-size="12.5">output column</text>
+        <!-- O -->
+        <rect x="400" y="898" width="240" height="44" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="520" y="926">Continue query</text>
+      </g>
+
+      <g stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#fa)">
+        <line x1="300" y1="74"  x2="300" y2="98"/>
+        <line x1="300" y1="148" x2="300" y2="172"/>
+        <line x1="300" y1="240" x2="300" y2="264"/>
+        <line x1="300" y1="314" x2="300" y2="338"/>
+        <line x1="300" y1="406" x2="300" y2="430"/>
+        <line x1="300" y1="480" x2="300" y2="504"/>
+        <line x1="300" y1="572" x2="300" y2="596"/>
+        <line x1="300" y1="646" x2="300" y2="670"/>
+        <line x1="300" y1="720" x2="300" y2="744"/>
+        <line x1="300" y1="794" x2="300" y2="818"/>
+        <line x1="740" y1="222" x2="740" y2="246"/>
+        <path d="M 430 209 L 614 209"/>
+        <path d="M 170 375 L 99 375 L 99 430"/>
+        <path d="M 170 541 L 99 541 L 99 486"/>
+        <path d="M 300 868 L 300 882 L 520 882 L 520 892"/>
+        <path d="M 740 296 L 740 882 L 526 882"/>
+      </g>
+
+      <g font-size="11.5" font-family="var(--mono)" fill="var(--muted)">
+        <text x="440" y="202">Yes</text>
+        <text x="312" y="258">No</text>
+        <text x="110" y="368">No</text>
+        <text x="312" y="424">Yes</text>
+        <text x="110" y="534">No</text>
+        <text x="312" y="590">Yes</text>
+      </g>
+
+      <g font-size="11.5" fill="var(--muted)">
+        <rect x="620" y="436" width="14" height="14" rx="3" fill="none" stroke="var(--s3)" stroke-width="1.8"/>
+        <text x="644" y="447">added by this work</text>
+        <rect x="620" y="462" width="14" height="14" rx="3" fill="none" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="644" y="473">runs on the GPU</text>
+        <rect x="620" y="488" width="14" height="14" rx="3" fill="none" stroke="var(--warn)" stroke-width="1.8"/>
+        <text x="644" y="499">unchanged CPU path</text>
+      </g>
+    </svg>

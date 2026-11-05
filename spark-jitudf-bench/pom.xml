@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.beehive-lab</groupId>
+    <artifactId>spark-jitudf-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-jitudf-bench</artifactId>
+  <packaging>jar</packaging>
+  <description>
+    The runnable end: the end-to-end test, the microbenchmark, the MovieLens application the
+    evaluation measures, the probes, and the UDFs they all use.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-mllib_${scala.binary.version}</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <!-- The MovieLens application reads cuDF columns directly for the attribution probes and
+         registers NVIDIA's RapidsUDF baseline. -->
+    <dependency>
+      <groupId>com.nvidia</groupId>
+      <artifactId>rapids-4-spark_${scala.binary.version}</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <!-- Declared so the reactor builds the plugin first and so the dependency is visible here,
+         not because anything in this module imports it. Nothing does: a UDF reaches the GPU
+         through spark.udf().register and the RAPIDS plugin, with no call to our API at all,
+         which is the claim these programs exist to demonstrate. Supplied on the spark-submit
+         jars list at run time (scripts/run-spark.sh). -->
+    <dependency>
+      <groupId>io.github.beehive-lab</groupId>
+      <artifactId>spark-jitudf-plugin</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+</project>

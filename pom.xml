@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.beehive-lab</groupId>
+  <artifactId>spark-jitudf-parent</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>spark-jitudf</name>
+  <description>
+    GPU-compiled Spark UDFs, through TornadoVM. Compiles a JVM UDF that the RAPIDS udf-compiler
+    declined into a GPU kernel, and runs it over the cuDF column buffers in place.
+  </description>
+
+  <modules>
+    <module>spark-jitudf-plugin</module>
+    <module>spark-jitudf-bench</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>21</maven.compiler.release>
+    <spark.version>4.0.4</spark.version>
+    <scala.binary.version>2.13</scala.binary.version>
+    <rapids.version>26.08.1</rapids.version>
+    <tornado.version>8.0.1-jdk21-dev</tornado.version>
+    <asm.version>9.7.1</asm.version>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-sql_${scala.binary.version}</artifactId>
+        <version>${spark.version}</version>
+      </dependency>
+      <!-- The RAPIDS distribution jar: RapidsUDF, the plugin, and the ai.rapids.cudf classes.
+           Compiled against the released jar; at run time the patched one from
+           scripts/build-rapids-patch.sh takes its place, which is what carries the fallback. -->
+      <!-- AlsProbe asks whether Spark's own ALS prediction UDF reaches a kernel unmodified. -->
+      <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-mllib_${scala.binary.version}</artifactId>
+        <version>${spark.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.nvidia</groupId>
+        <artifactId>rapids-4-spark_${scala.binary.version}</artifactId>
+        <version>${rapids.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.beehive-lab</groupId>
+        <artifactId>tornado-api</artifactId>
+        <version>${tornado.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.beehive-lab</groupId>
+        <artifactId>tornado-runtime</artifactId>
+        <version>${tornado.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.ow2.asm</groupId>
+        <artifactId>asm</artifactId>
+        <version>${asm.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.ow2.asm</groupId>
+        <artifactId>asm-tree</artifactId>
+        <version>${asm.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.ow2.asm</groupId>
+        <artifactId>asm-analysis</artifactId>
+        <version>${asm.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.ow2.asm</groupId>
+        <artifactId>asm-util</artifactId>
+        <version>${asm.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.13.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>3.5.3</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

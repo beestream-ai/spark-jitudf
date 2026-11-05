@@ -1,0 +1,120 @@
+    <svg viewBox="0 0 1000 566" role="img"
+         aria-label="Two-phase architecture. On the Spark driver at planning time, a registered JVM UDF is declined by the RAPIDS udf-compiler, offered to a TornadoVM provider that analyses its bytecode and either refuses it back to the CPU plan or generates a kernel class, which is serialised into a GPU plan. On the executor, for each batch, a cuDF column's device address is read by an adapter, bound into a device view, read in place by the kernel, and the output RMM allocation is wrapped as a result column. All allocations stay in GPU memory owned by cuDF and RMM; addresses are borrowed, never copied and never freed."
+         style="font-family: var(--display); color: var(--fg)">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+        <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- ============ lane 1: driver ============ -->
+      <text x="24" y="22" font-size="12" font-weight="600" fill="currentColor" letter-spacing="0.08em">DRIVER &mdash; QUERY PLANNING, NO GPU NEEDED</text>
+      <rect x="12" y="34" width="976" height="166" rx="10" fill="none" stroke="currentColor" stroke-opacity="0.18" stroke-dasharray="3 4"/>
+
+      <g font-size="12.5" fill="currentColor">
+        <rect x="24"  y="54" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="104" y="79"  text-anchor="middle" font-weight="600">Registered JVM UDF</text>
+        <text x="104" y="97"  text-anchor="middle" font-size="11" fill="var(--muted)">spark.udf().register(…)</text>
+
+        <rect x="214" y="54" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="294" y="79"  text-anchor="middle" font-weight="600">RAPIDS udf-compiler</text>
+        <text x="294" y="97"  text-anchor="middle" font-size="11" fill="var(--muted)">declines: LOOP</text>
+
+        <rect x="404" y="54" width="160" height="62" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="484" y="79"  text-anchor="middle" font-weight="600">TornadoVM provider</text>
+        <text x="484" y="97"  text-anchor="middle" font-size="11" fill="var(--muted)">ASM · verify · load</text>
+
+        <rect x="594" y="54" width="160" height="62" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="674" y="79"  text-anchor="middle" font-weight="600">Kernel class</text>
+        <text x="674" y="97"  text-anchor="middle" font-size="11" fill="var(--muted)">+ argument descriptor</text>
+
+        <rect x="784" y="54" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="864" y="79"  text-anchor="middle" font-weight="600">GPU plan</text>
+        <text x="864" y="97"  text-anchor="middle" font-size="11" fill="var(--muted)">GpuScalaUDF</text>
+      </g>
+
+      <g stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#ah)">
+        <line x1="184" y1="85" x2="208" y2="85"/>
+        <line x1="374" y1="85" x2="398" y2="85"/>
+        <line x1="564" y1="85" x2="588" y2="85"/>
+        <line x1="754" y1="85" x2="778" y2="85"/>
+      </g>
+
+      <!-- refusal branch -->
+      <g>
+        <line x1="484" y1="116" x2="484" y2="146" stroke="currentColor" stroke-width="1.5" marker-end="url(#ah)"/>
+        <rect x="372" y="150" width="224" height="30" rx="6" fill="var(--surface-2)" stroke="currentColor" stroke-opacity="0.3"/>
+        <text x="484" y="169" text-anchor="middle" font-size="11.5" fill="var(--muted)">refused &rarr; original CPU plan, unchanged</text>
+      </g>
+
+      <!-- driver to executor -->
+      <g>
+        <line x1="674" y1="116" x2="674" y2="256" stroke="var(--accent)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ahd)"/>
+        <text x="688" y="152" font-size="11" fill="var(--accent)">class bytes + descriptor</text>
+        <text x="688" y="168" font-size="11" fill="var(--accent)">serialised to the executor</text>
+        <text x="688" y="184" font-size="11" fill="var(--muted)">no pointers travel</text>
+      </g>
+
+      <!-- ============ lane 2: executor ============ -->
+      <text x="24" y="228" font-size="12" font-weight="600" fill="currentColor" letter-spacing="0.08em">EXECUTOR &mdash; ONCE PER BATCH</text>
+      <rect x="12" y="240" width="976" height="118" rx="10" fill="none" stroke="currentColor" stroke-opacity="0.18" stroke-dasharray="3 4"/>
+
+      <g font-size="12.5" fill="currentColor">
+        <rect x="24"  y="262" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="104" y="287" text-anchor="middle" font-weight="600">cuDF column</text>
+        <text x="104" y="305" text-anchor="middle" font-size="11" fill="var(--muted)">evaluated by RAPIDS</text>
+
+        <rect x="214" y="262" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="294" y="287" text-anchor="middle" font-weight="600">Adapter</text>
+        <text x="294" y="305" text-anchor="middle" font-size="11" fill="var(--muted)">reads device address</text>
+
+        <rect x="404" y="262" width="160" height="62" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="484" y="287" text-anchor="middle" font-weight="600">Device view</text>
+        <text x="484" y="305" text-anchor="middle" font-size="11" fill="var(--muted)">bindExternalBuffer</text>
+
+        <rect x="594" y="262" width="160" height="62" rx="7" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.8"/>
+        <text x="674" y="287" text-anchor="middle" font-weight="600">CUDA kernel</text>
+        <text x="674" y="305" text-anchor="middle" font-size="11" fill="var(--muted)">headerless addressing</text>
+
+        <rect x="784" y="262" width="160" height="62" rx="7" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.5"/>
+        <text x="864" y="287" text-anchor="middle" font-weight="600">Result column</text>
+        <text x="864" y="305" text-anchor="middle" font-size="11" fill="var(--muted)">cuDF takes ownership</text>
+      </g>
+
+      <g stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#ah)">
+        <line x1="184" y1="293" x2="208" y2="293"/>
+        <line x1="374" y1="293" x2="398" y2="293"/>
+        <line x1="564" y1="293" x2="588" y2="293"/>
+        <line x1="754" y1="293" x2="778" y2="293"/>
+      </g>
+
+      <!-- ============ lane 3: GPU memory ============ -->
+      <text x="24" y="398" font-size="12" font-weight="600" fill="currentColor" letter-spacing="0.08em">GPU MEMORY &mdash; OWNED BY cuDF / RMM</text>
+      <rect x="12" y="410" width="976" height="86" rx="10" fill="var(--surface-2)" stroke="currentColor" stroke-opacity="0.25"/>
+
+      <g font-size="11.5" fill="currentColor">
+        <rect x="44"  y="432" width="220" height="44" rx="6" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.35"/>
+        <text x="154" y="459" text-anchor="middle">input column data</text>
+
+        <rect x="300" y="432" width="300" height="44" rx="6" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.35"/>
+        <text x="450" y="459" text-anchor="middle">LIST offsets + flattened child</text>
+
+        <rect x="636" y="432" width="300" height="44" rx="6" fill="var(--surface)" stroke="currentColor" stroke-opacity="0.35"/>
+        <text x="786" y="459" text-anchor="middle">output allocation (RMM)</text>
+      </g>
+
+      <g stroke="var(--accent)" stroke-width="1.6" fill="none" stroke-dasharray="4 4" marker-end="url(#ahd)">
+        <line x1="300" y1="430" x2="300" y2="330"/>
+        <line x1="690" y1="430" x2="690" y2="330"/>
+      </g>
+      <line x1="880" y1="330" x2="880" y2="428" stroke="var(--accent)" stroke-width="1.6" fill="none" stroke-dasharray="4 4" marker-end="url(#ahd)"/>
+
+      <text x="308" y="352" font-size="11" fill="var(--accent)">address borrowed</text>
+      <text x="698" y="352" font-size="11" fill="var(--accent)">read / written in place</text>
+      <text x="888" y="352" font-size="11" fill="var(--accent)">output handed over</text>
+
+      <text x="24" y="540" font-size="11.5" fill="var(--muted)">Nothing in this band is copied to the host, copied device-to-device, or freed by TornadoVM. A device view holds an address; it never owns one.</text>
+    </svg>
