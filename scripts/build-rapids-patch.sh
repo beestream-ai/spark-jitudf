@@ -17,7 +17,10 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
+# The fork and branch that carry the fallback hook. Cloning instructions are in REPRODUCING.md;
+# without this branch there is nothing for the plugin to be called from.
 FORK=${RAPIDS_SRC:-$TP/cudf-spark}
+RAPIDS_BASE_REF=${RAPIDS_BASE_REF:-origin/release/26.08}
 JAR_IN=$TP/rapids-4-spark_2.13-26.08.1.jar
 JAR_OUT=$TP/rapids-4-spark_2.13-26.08.1-tornado.jar
 
@@ -29,13 +32,13 @@ fi
 # The sources this fork changed, relative to the upstream commit it was branched from. Derived
 # rather than listed, so that a source added later cannot be silently left out of the jar.
 #
-# The base is the branch point: the parent of the oldest commit on this branch that no remote
-# has. It is found that way rather than from @{upstream} because the branch has no upstream
-# configured, and the previous `merge-base HEAD HEAD~1` fallback silently resolved to HEAD~1 --
-# so a second commit on the branch reduced the patch to that one commit's classes and quietly
-# dropped the rest. Override with RAPIDS_BASE if the branch is ever rebased onto something else.
+# The base is the branch point: where feature/tornadovm-udf-fallback left the release it was cut
+# from. Derived rather than written down, so that a source added to the branch later cannot be
+# silently left out of the jar -- but derived from the merge-base with the upstream release line,
+# not from "commits no remote has", because the branch is published and every one of its commits
+# is on a remote. Override with RAPIDS_BASE if the branch is rebased onto something else.
 cd "$FORK"
-BASE=${RAPIDS_BASE:-$(git rev-list HEAD --not --remotes | tail -1)^}
+BASE=${RAPIDS_BASE:-$(git merge-base HEAD "$RAPIDS_BASE_REF" 2>/dev/null)}
 if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
   echo "cannot determine the branch point of $(git branch --show-current) in $FORK" >&2
   echo "set RAPIDS_BASE to the upstream commit it was branched from" >&2

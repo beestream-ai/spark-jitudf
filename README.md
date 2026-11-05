@@ -48,13 +48,15 @@ fallback given the whole machine. Both numbers, what separates them, and what th
 
 ## Getting it running
 
-One other repository is needed: the RAPIDS fork branch that makes the UDF compiler say *why* it
-declined a UDF and lets something else try. Apache Spark is unmodified — the stock 4.0.4 binary
-distribution is what runs here.
+One other repository is needed: [`beehive-lab/cudf-spark`](https://github.com/beehive-lab/cudf-spark)
+on branch `feature/tornadovm-udf-fallback`, a fork of NVIDIA's RAPIDS plugin that makes the UDF
+compiler say *why* it declined a UDF and lets something else try. TornadoVM is an ordinary release
+build with the CUDA backend, and Apache Spark is unmodified — the stock 4.0.4 binary distribution
+is what runs here.
 
 ```bash
-git clone https://github.com/NVIDIA/cudf-spark third_party/cudf-spark
-git -C third_party/cudf-spark checkout feature/tornadovm-udf-fallback
+git clone --branch feature/tornadovm-udf-fallback \
+  https://github.com/beehive-lab/cudf-spark third_party/cudf-spark
 
 export JAVA_HOME=/path/to/jdk-21
 export TORNADO_SDK=/path/to/tornadovm/dist/tornadovm-*-cuda
@@ -97,5 +99,6 @@ the claims that were withdrawn under review.
 Apache License 2.0; the full text is in [LICENSE](LICENSE). Every source file carries the matching
 header.
 
-The RAPIDS changes this depends on stay under that project's own Apache 2.0 licence and keep its
-file headers; nothing here relicenses them, and no file here ships in NVIDIA's package namespace.
+The RAPIDS changes this depends on live in [`beehive-lab/cudf-spark`](https://github.com/beehive-lab/cudf-spark),
+stay under that project's own Apache 2.0 licence and keep its file headers; nothing here
+relicenses them, and no file here ships in NVIDIA's package namespace.
