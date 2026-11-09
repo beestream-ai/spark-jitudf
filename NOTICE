@@ -1,0 +1,40 @@
+spark-jitudf
+Copyright (c) 2026 Beestream Ltd.
+
+spark-jitudf is licensed under the Apache License, Version 2.0 (see LICENSE). Every source
+file in this repository carries the matching header.
+
+No third-party source is included here. The build and the evaluation use the material below,
+each fetched from its own project and staying under its own licence.
+
+1. NVIDIA RAPIDS Accelerator for Apache Spark (cudf-spark), under the Apache License, Version 2.0
+
+   The plugin is compiled against the released rapids-4-spark jar, and
+   scripts/build-rapids-patch.sh replaces classes in a copy of that jar with ones built from
+   https://github.com/beestream-ai/cudf-spark, branch feature/tornadovm-udf-fallback, a fork of
+   https://github.com/NVIDIA/cudf-spark. Those changes stay under the RAPIDS project's Apache 2.0
+   licence and keep its file headers. Nothing here relicenses them, and no file here ships in
+   NVIDIA's package namespace.
+
+2. NVIDIA spark-rapids-examples, under the Apache License, Version 2.0
+
+   scripts/build-native-udf.sh compiles NVIDIA's published native cosine-similarity UDF, from
+   https://github.com/NVIDIA/spark-rapids-examples, as the B3 baseline. The sources are NVIDIA's
+   and are not edited or redistributed here; only the build is adapted.
+
+3. TornadoVM, under the Apache License, Version 2.0
+
+   https://github.com/beehive-lab/TornadoVM, used as a released SDK and as the Maven artifacts
+   io.github.beehive-lab:tornado-api and io.github.beehive-lab:tornado-runtime.
+
+4. Apache Spark, under the Apache License, Version 2.0
+
+   https://spark.apache.org, used as the stock binary distribution, unmodified.
+
+5. The MovieLens 25M data set, under the GroupLens research licence
+
+   The evaluation prepares its inputs from MovieLens 25M (F. M. Harper and J. A. Konstan,
+   "The MovieLens Datasets: History and Context", ACM TiiS 5(4), 2015,
+   https://doi.org/10.1145/2827872), downloaded by the reader from
+   https://files.grouplens.org/datasets/movielens/ml-25m.zip under the terms stated there.
+   No MovieLens data is redistributed in this repository.

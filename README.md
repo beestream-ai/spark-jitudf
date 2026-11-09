@@ -48,7 +48,7 @@ fallback given the whole machine. Both numbers, what separates them, and what th
 
 ## Getting it running
 
-One other repository is needed: [`beehive-lab/cudf-spark`](https://github.com/beehive-lab/cudf-spark)
+One other repository is needed: [`beestream-ai/cudf-spark`](https://github.com/beestream-ai/cudf-spark)
 on branch `feature/tornadovm-udf-fallback`, a fork of NVIDIA's RAPIDS plugin that makes the UDF
 compiler say *why* it declined a UDF and lets something else try. TornadoVM is an ordinary release
 build with the CUDA backend, and Apache Spark is unmodified — the stock 4.0.4 binary distribution
@@ -56,7 +56,7 @@ is what runs here.
 
 ```bash
 git clone --branch feature/tornadovm-udf-fallback \
-  https://github.com/beehive-lab/cudf-spark third_party/cudf-spark
+  https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
 
 export JAVA_HOME=/path/to/jdk-21
 export TORNADO_SDK=/path/to/tornadovm/dist/tornadovm-*-cuda
@@ -64,7 +64,7 @@ export SPARK_HOME=/path/to/spark-4.0.4-bin-hadoop3
 
 ./scripts/build-rapids-patch.sh     # the fork's changes into the released RAPIDS jar
 mvn package                         # both modules, and the plugin's 33 unit tests
-./scripts/run-spark.sh io.github.beehivelab.jitudf.bench.IntegrationTest
+./scripts/run-spark.sh ai.beestream.jitudf.bench.IntegrationTest
 ```
 
 The last command must end `CHECKS: 27, FAILURES: 0`. Full prerequisites, the MovieLens data and
@@ -96,9 +96,11 @@ the claims that were withdrawn under review.
 
 ## License
 
-Apache License 2.0; the full text is in [LICENSE](LICENSE). Every source file carries the matching
-header.
+spark-jitudf is released under the [Apache License, Version 2.0](LICENSE). Copyright (c) 2026
+Beestream Ltd. Every source file carries the matching header.
 
-The RAPIDS changes this depends on live in [`beehive-lab/cudf-spark`](https://github.com/beehive-lab/cudf-spark),
-stay under that project's own Apache 2.0 licence and keep its file headers; nothing here
-relicenses them, and no file here ships in NVIDIA's package namespace.
+Nothing third-party is included here; what the build and the evaluation fetch from elsewhere is
+listed in [NOTICE](NOTICE). In particular, the RAPIDS changes this depends on live in
+[`beestream-ai/cudf-spark`](https://github.com/beestream-ai/cudf-spark), stay under that project's
+own Apache 2.0 licence and keep its file headers; nothing here relicenses them, and no file here
+ships in NVIDIA's package namespace.
