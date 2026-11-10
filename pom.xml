@@ -49,7 +49,12 @@
     <spark.version>4.0.4</spark.version>
     <scala.binary.version>2.13</scala.binary.version>
     <rapids.version>26.08.1</rapids.version>
-    <tornado.version>8.0.1-jdk21-dev</tornado.version>
+    <!-- TornadoVM 8.1.0 or newer, from Maven Central: it carries the device-view API this plugin
+         binds the cuDF buffers through. Running on a GPU also needs a built TornadoVM SDK with the
+         CUDA backend (TORNADO_SDK); the Maven artifacts here are only what the code compiles
+         against. To build against a TornadoVM develop install, pass its version:
+         -Dtornado.version=8.1.1-jdk21-dev. -->
+    <tornado.version>8.1.0-jdk21</tornado.version>
     <asm.version>9.7.1</asm.version>
     <junit.version>5.10.2</junit.version>
   </properties>

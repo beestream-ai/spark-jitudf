@@ -42,31 +42,82 @@ establish are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spa
 | `scripts/` | `env.sh` (paths, all overridable), `run-spark.sh` (launcher), `build-rapids-patch.sh`, `build-rapids-reactor.sh`. |
 | [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking) | The benchmark drivers, the correctness checks, the results and the evaluation. |
 
+## What you need
+
+| | |
+|---|---|
+| GPU | NVIDIA, compute capability 7.0+, 8 GiB or more |
+| Driver | 525 or newer, for CUDA 12 |
+| JDK | 21 |
+| Maven | 3.9 or newer |
+| TornadoVM | **8.1.0 or newer**, built with the CUDA backend. Earlier versions lack the device-view API the cuDF buffers are bound through. [Installation](https://tornadovm.readthedocs.io/en/latest/installation.html) |
+| Spark | 4.0.4, Scala 2.13, the stock binary distribution. Unmodified. |
+| RAPIDS | The released 26.08.1 jar, with the fork's classes patched in (below) |
+
+Only `mvn package` is needed to run the unit tests; everything else is needed to reach a GPU.
+
 ## Getting it running
 
 One other repository is needed: [`beestream-ai/cudf-spark`](https://github.com/beestream-ai/cudf-spark)
 on branch `feature/tornadovm-udf-fallback`, a fork of NVIDIA's RAPIDS plugin that makes the UDF
-compiler say *why* it declined a UDF and lets something else try. TornadoVM is an ordinary release
-build with the CUDA backend, and Apache Spark is unmodified — the stock 4.0.4 binary distribution
-is what runs here.
+compiler say *why* it declined a UDF and lets something else try. Without it there is no hook for
+this plugin to be called from, and the released jar will not do.
 
 ```bash
+# the three that have no sensible default on another machine
+export JAVA_HOME=/path/to/jdk-21
+export TORNADO_SDK=/path/to/tornadovm/dist/tornadovm-*-cuda   # holds bin/, share/java/tornado
+export SPARK_HOME=/path/to/spark-4.0.4-bin-hadoop3
+
+mkdir -p third_party
+
+# Spark, if you do not have it
+curl -L https://archive.apache.org/dist/spark/spark-4.0.4/spark-4.0.4-bin-hadoop3.tgz \
+  | tar xz -C third_party
+
+# the released RAPIDS jar the fork's classes are patched into
+curl -L -o third_party/rapids-4-spark_2.13-26.08.1.jar \
+  https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.13/26.08.1/rapids-4-spark_2.13-26.08.1.jar
+
+# the fork
 git clone --branch feature/tornadovm-udf-fallback \
   https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
-
-export JAVA_HOME=/path/to/jdk-21
-export TORNADO_SDK=/path/to/tornadovm/dist/tornadovm-*-cuda
-export SPARK_HOME=/path/to/spark-4.0.4-bin-hadoop3
 
 ./scripts/build-rapids-patch.sh     # the fork's changes into the released RAPIDS jar
 mvn package                         # both modules, and the plugin's 33 unit tests
 ./scripts/run-spark.sh ai.beestream.jitudf.bench.IntegrationTest
 ```
 
-The last command must end `CHECKS: 27, FAILURES: 0`. Full prerequisites, the MovieLens data and
-the measurement protocol are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
+The last command must end `CHECKS: 27, FAILURES: 0`.
+
+Every path above can be overridden from the environment; `scripts/env.sh` lists them and derives
+the rest from the repository root, so a clone anywhere works without editing anything.
 
 It is **off by default**. Nothing changes until `spark.rapids.sql.tornadovm.enabled=true` is set.
+
+## Trying it
+
+Each of these is `./scripts/run-spark.sh <class>`. They need the build above; none needs a dataset.
+
+| Class (under `ai.beestream.jitudf.bench`) | What it shows |
+|---|---|
+| `IntegrationTest` | The whole thing: a UDF with a loop reaching a kernel, a string-returning UDF correctly staying on the CPU, an expression RAPIDS already handled keeping its path, and every accelerated value compared row by row against the same UDF on the CPU. Ends `CHECKS: 27, FAILURES: 0`. |
+| `RapidsSmokeTest` | That RAPIDS itself initialises and puts a plain query on the GPU. Run this first if the integration test fails — it separates "RAPIDS is not working here" from "the integration is not working here". |
+| `Benchmark` | End-to-end timings of one query under each configuration, on whatever machine you are on. |
+| `ListStress` | The `ArrayType`/cuDF `LIST` path on its own, at a range of sizes. |
+| `PlanDump` | The executed physical plan, so you can see which operator the UDF became. |
+| `ArrayUdfProbe`, `WrapperProbe` | What Spark actually hands and wraps a Java UDF in. Diagnostics, for when a UDF you wrote is refused. |
+| `AlsProbe` | Whether Spark's own ALS prediction UDF reaches a kernel unmodified. |
+
+To try your own UDF, copy one from `spark-jitudf-bench/src/main/java/ai/beestream/jitudf/bench/udfs/`
+— `LoopUdf` is the simplest — register it, and run a query over it. `TornadoUdfProvider.decisions()`
+then says what was compiled and what was refused, and a refusal names the construct that caused it
+(`LOOP`, `UNSUPPORTED_MATH`, `OBJECT_ACCESS`, and so on). `IntegrationTest` prints that log at the
+end of its run, so it doubles as a worked example of how to read it.
+
+The `movielens` classes are the measured application; they need the MovieLens 25M dataset, and
+their data preparation and measurement protocol are in
+[spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
 
 ## What it handles
 

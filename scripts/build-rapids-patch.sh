@@ -24,6 +24,17 @@ RAPIDS_BASE_REF=${RAPIDS_BASE_REF:-origin/release/26.08}
 JAR_IN=$TP/rapids-4-spark_2.13-26.08.1.jar
 JAR_OUT=$TP/rapids-4-spark_2.13-26.08.1-tornado.jar
 
+# The released jar this patches. Checked here rather than at the cp below, because the reactor
+# build above it takes minutes and failing after that with "cp: No such file" tells you nothing.
+if [ ! -f "$JAR_IN" ]; then
+  echo "missing the released RAPIDS jar: $JAR_IN" >&2
+  echo "download it once:" >&2
+  echo "  mkdir -p $TP && curl -L -o $JAR_IN \\" >&2
+  echo "    https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.13/26.08.1/rapids-4-spark_2.13-26.08.1.jar" >&2
+  echo "or set RAPIDS_JAR_STOCK if you keep it elsewhere." >&2
+  exit 2
+fi
+
 if [ "${SKIP_REACTOR:-false}" != "true" ]; then
   echo "=== reactor build ==="
   "$ROOT/scripts/build-rapids-reactor.sh" package
