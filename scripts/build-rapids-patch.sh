@@ -17,7 +17,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
-# The fork and branch that carry the fallback hook. Cloning instructions are in REPRODUCING.md;
+# The fork and branch that carry the fallback hook. Cloning instructions are in the README;
 # without this branch there is nothing for the plugin to be called from.
 FORK=${RAPIDS_SRC:-$TP/cudf-spark}
 RAPIDS_BASE_REF=${RAPIDS_BASE_REF:-origin/release/26.08}

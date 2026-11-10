@@ -30,5 +30,6 @@ export JITUDF_VERSION=${JITUDF_VERSION:-0.1.0-SNAPSHOT}
 export PLUGIN_JAR=${PLUGIN_JAR:-$ROOT/spark-jitudf-plugin/target/spark-jitudf-plugin-$JITUDF_VERSION-with-deps.jar}
 export BENCH_JAR=${BENCH_JAR:-$ROOT/spark-jitudf-bench/target/spark-jitudf-bench-$JITUDF_VERSION.jar}
 
-# NVIDIA's native cosine-similarity UDF, built by scripts/build-native-udf.sh (B3 baseline).
+# NVIDIA's native cosine-similarity UDF, the B3 baseline. Built by scripts/build-native-udf.sh
+# in spark-jitudf-benchmarking; set this if you have one, and the 'native' mode can use it.
 export NATIVE_UDF_JAR=${NATIVE_UDF_JAR:-$TP/native-udf/nvidia-udf-examples.jar}

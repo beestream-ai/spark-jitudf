@@ -289,7 +289,7 @@ public final class MovieSimilarityApp {
             // NVIDIA's own class. It implements RapidsUDF, so RAPIDS calls its evaluateColumnar
             // directly and the JVM call() path is never used on the GPU plan.
             // Supplied on the classpath rather than vendored here, so this repository ships no
-            // classes in NVIDIA's package namespace: scripts/build-native-udf.sh builds it from
+            // classes in NVIDIA's package namespace: spark-jitudf-benchmarking's scripts/build-native-udf.sh builds it from
             // NVIDIA's own RAPIDS-accelerated-UDFs examples. Absent, only this mode is lost.
             spark.udf().register("cosine_native", nvidiaCosineUdf(), DataTypes.FloatType);
         }
@@ -310,7 +310,7 @@ public final class MovieSimilarityApp {
                     .getDeclaredConstructor().newInstance();
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(name + " is not on the classpath; build it with "
-                    + "scripts/build-native-udf.sh, or run a mode other than 'native'", e);
+                    + "spark-jitudf-benchmarking's scripts/build-native-udf.sh, or run a mode other than 'native'", e);
         }
     }
 

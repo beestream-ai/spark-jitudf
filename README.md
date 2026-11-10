@@ -25,15 +25,13 @@ unmodified.
 
 ## Why
 
-For a UDF the plugin cannot translate, **turning RAPIDS on makes the measured application 1.44x to
-1.76x slower than not using the GPU at all.** Each batch leaves the GPU, becomes rows, is scored in
-the JVM, and returns. That is the right thing for the plugin to do — correct answers beat refusing
-— and it is the cost this removes.
+For a UDF the plugin cannot translate, **turning RAPIDS on can make an application slower than not
+using the GPU at all.** Each batch leaves the GPU, becomes rows, is scored in the JVM, and returns.
+That is the right thing for the plugin to do — correct answers beat refusing — and it is the cost
+this removes.
 
-Against that baseline, on a MovieLens similarity query at 199,800 candidate pairs:
-**4.89x faster** [4.67, 5.27] for the query as written, or **2.43x** [2.23, 2.66] against a CPU
-fallback given the whole machine. Both numbers, what separates them, and what the evaluation does
-*not* establish are in [EVALUATION.md](EVALUATION.md).
+The measurements, what separates the figures that can be quoted, and what the evaluation does *not*
+establish are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
 
 ## What is here
 
@@ -41,10 +39,8 @@ fallback given the whole machine. Both numbers, what separates them, and what th
 |---|---|
 | `spark-jitudf-plugin/` | The module RAPIDS calls into: UDF resolution, eligibility analysis, ASM lowering, kernel generation, cuDF buffer adapters, caches. |
 | `spark-jitudf-bench/` | The runnable end: the end-to-end test, the microbenchmark, the MovieLens application the evaluation measures, the probes, and the UDFs they all use. |
-| `scripts/` | `env.sh` (paths, all overridable), `run-spark.sh` (launcher), `build-rapids-patch.sh`, `tvm-gate.sh`, the benchmark driver and the correctness checker. |
-| `evaluation/` | The result data and figures behind EVALUATION.md. |
-| [EVALUATION.md](EVALUATION.md) | What was measured, the numbers, and their limits. |
-| [REPRODUCING.md](REPRODUCING.md) | How to re-run all of it. |
+| `scripts/` | `env.sh` (paths, all overridable), `run-spark.sh` (launcher), `build-rapids-patch.sh`, `build-rapids-reactor.sh`. |
+| [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking) | The benchmark drivers, the correctness checks, the results and the evaluation. |
 
 ## Getting it running
 
@@ -68,7 +64,7 @@ mvn package                         # both modules, and the plugin's 33 unit tes
 ```
 
 The last command must end `CHECKS: 27, FAILURES: 0`. Full prerequisites, the MovieLens data and
-the measurement protocol are in [REPRODUCING.md](REPRODUCING.md).
+the measurement protocol are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
 
 It is **off by default**. Nothing changes until `spark.rapids.sql.tornadovm.enabled=true` is set.
 
@@ -90,9 +86,9 @@ execution fails the task.
 
 ## Status
 
-Research code. One application, one dataset, one laptop GPU, Spark `local` mode. No cluster,
-multi-GPU or production claim. See [EVALUATION.md](EVALUATION.md) §8 for the full list, including
-the claims that were withdrawn under review.
+Research code. One application, one dataset, Spark `local` mode. No cluster, multi-GPU or
+production claim. [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking) §8 has the full list, including the claims
+that were withdrawn under review.
 
 ## License
 

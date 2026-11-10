@@ -38,7 +38,7 @@ public final class LambdaProbe {
         SparkSession spark = b.getOrCreate();
         spark.sparkContext().setLogLevel("ERROR");
         // NVIDIA's class is not a build dependency of this repository; it is supplied on the
-        // classpath by scripts/build-native-udf.sh. Loaded reflectively so that nothing here
+        // classpath by spark-jitudf-benchmarking's scripts/build-native-udf.sh. Loaded reflectively so that nothing here
         // ships in NVIDIA's package namespace.
         @SuppressWarnings("unchecked")
         UDF2<Seq<Float>, Seq<Float>, Float> nvidia = (UDF2<Seq<Float>, Seq<Float>, Float>)

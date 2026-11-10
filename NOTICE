@@ -18,9 +18,10 @@ each fetched from its own project and staying under its own licence.
 
 2. NVIDIA spark-rapids-examples, under the Apache License, Version 2.0
 
-   scripts/build-native-udf.sh compiles NVIDIA's published native cosine-similarity UDF, from
-   https://github.com/NVIDIA/spark-rapids-examples, as the B3 baseline. The sources are NVIDIA's
-   and are not edited or redistributed here; only the build is adapted.
+   The MovieLens application's 'native' mode loads NVIDIA's published native cosine-similarity
+   UDF, from https://github.com/NVIDIA/spark-rapids-examples, reflectively when it is on the class
+   path, as the B3 baseline. Nothing of NVIDIA's is compiled or redistributed here; the harness
+   that builds it is in https://github.com/beestream-ai/spark-jitudf-benchmarking.
 
 3. TornadoVM, under the Apache License, Version 2.0
 
