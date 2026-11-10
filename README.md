@@ -50,7 +50,7 @@ establish are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spa
 | Driver | 525 or newer, for CUDA 12 |
 | JDK | 21 |
 | Maven | 3.9 or newer |
-| TornadoVM | **8.1.0 or newer**, built with the CUDA backend. Earlier versions lack the device-view API the cuDF buffers are bound through. [Installation](https://tornadovm.readthedocs.io/en/latest/installation.html) |
+| TornadoVM | **8.1.0 or newer**, with the CUDA backend. Earlier versions lack the device-view API the cuDF buffers are bound through. The quickest way is SDKMAN: `sdk install tornadovm 8.1.0-jdk21-cuda`, which gives you a `TORNADO_SDK` directory directly. Otherwise [build it](https://tornadovm.readthedocs.io/en/latest/installation.html). |
 | Spark | 4.0.4, Scala 2.13, the stock binary distribution. Unmodified. |
 | RAPIDS | The released 26.08.1 jar, with the fork's classes patched in (below) |
 
@@ -92,6 +92,11 @@ The last command must end `CHECKS: 27, FAILURES: 0`.
 
 Every path above can be overridden from the environment; `scripts/env.sh` lists them and derives
 the rest from the repository root, so a clone anywhere works without editing anything.
+
+On an SDKMAN install, `tornado --devices` fails with `Module tornado.clblast not found`. That is a
+quirk of that package's own launcher and does not affect anything here: `run-spark.sh` builds its
+own module path and asks only for `tornado.runtime`, `tornado.drivers.common` and
+`tornado.drivers.cuda`. Use `RapidsSmokeTest` below to check your setup instead.
 
 It is **off by default**. Nothing changes until `spark.rapids.sql.tornadovm.enabled=true` is set.
 
