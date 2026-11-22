@@ -45,6 +45,14 @@
     </dependency>
     <!-- The MovieLens application reads cuDF columns directly for the attribution probes and
          registers NVIDIA's RapidsUDF baseline. -->
+    <!-- Ahead of rapids-4-spark, for the same reason as in the plugin: both carry ai.rapids.cudf
+         and only this one has the generalized ColumnView.transform the probes call. -->
+    <dependency>
+      <groupId>com.nvidia</groupId>
+      <artifactId>spark-rapids-jni</artifactId>
+      <classifier>${cudf.jni.classifier}</classifier>
+      <scope>provided</scope>
+    </dependency>
     <dependency>
       <groupId>com.nvidia</groupId>
       <artifactId>rapids-4-spark_${scala.binary.version}</artifactId>

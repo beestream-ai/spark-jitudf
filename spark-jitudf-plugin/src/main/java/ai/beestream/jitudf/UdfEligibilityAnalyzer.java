@@ -155,13 +155,39 @@ public final class UdfEligibilityAnalyzer {
      */
     public static EligibilityResult analyse(ResolvedUdf udf, List<DataType> inputTypes, DataType outputType, boolean inputsNullable, boolean deterministic,
             boolean canReportArithmeticErrors) {
+        return analyse(udf, inputTypes, outputType, inputsNullable, deterministic, canReportArithmeticErrors, false);
+    }
+
+    /**
+     * As above, for a backend that can also run the UDF over a nullable column.
+     *
+     * <p>
+     * {@code canRunNullAware} says that two things are true at once: TC can compile the method in
+     * its null-aware mode, and the binding can call it with {@code null_aware::YES}. Then a null
+     * does not have to be guessed at -- it is passed to the compiled method, exactly as Spark
+     * passes it to the method on the CPU, and whatever that method answers is the answer. Without
+     * both halves a nullable column is still refused, because the alternative on offer -- copying
+     * the input's validity mask onto the output -- is wrong for every UDF that does something other
+     * than return null for a null.
+     * </p>
+     */
+    public static EligibilityResult analyse(ResolvedUdf udf, List<DataType> inputTypes, DataType outputType, boolean inputsNullable, boolean deterministic,
+            boolean canReportArithmeticErrors, boolean canRunNullAware) {
         if (udf == null) {
             return EligibilityResult.ineligible("the user's UDF could not be found behind Spark's wrapper");
         }
         if (!deterministic) {
             return EligibilityResult.ineligible("the UDF is not deterministic");
         }
-        if (inputsNullable) {
+        // Null-aware whenever nulls are in play at all: either the column can hold one, or the UDF
+        // itself talks about nulls. The second half matters more than it looks. A UDF that opens
+        // with a defensive `if (value == null)` is perfectly ordinary, and over a non-nullable
+        // column that test is dead code -- but it is still in the bytecode, and the plain lowering
+        // erases the boxes the test is about, so there is nothing left for `== null` to mean. The
+        // choice is between refusing a UDF that would have run correctly and compiling it in the
+        // mode that can express the test. The second costs an optional per value and is right.
+        boolean nullAware = canRunNullAware && (inputsNullable || entryTestsForNull(udf));
+        if (inputsNullable && !canRunNullAware) {
             // Not "not implemented yet": the obvious implementation is unsound here, and the measurement
             // is in bench/NullSemanticsProbe. Spark skips a UDF and yields null for a null argument only
             // where it knows the argument to be primitive (ScalaUDF.inputPrimitives). A Java UDF1<Long,
@@ -171,11 +197,11 @@ public final class UdfEligibilityAnalyzer {
             // whatever it chooses, which is rarely null. Propagating the input's validity mask onto the
             // output would silently replace both with null.
             //
-            // Doing this properly means compiling the null test, which is TC's --null-aware mode: it
-            // takes cuda::std::optional arguments, and the transform binding we call cannot pass those.
-            // Until it can, a nullable column stays on the CPU, where it is correct.
+            // Doing it properly means compiling the null test, which is TC's --null-aware mode: it takes
+            // cuda::std::optional arguments, and the binding has to be able to ask for them. Where both
+            // are available the branch above is taken instead; this one is the backend that cannot.
             return EligibilityResult.ineligible("an input column is nullable, and Spark passes a null argument to a UDF with a boxed parameter rather than "
-                    + "short-circuiting it, so the UDF's own null behaviour would have to be compiled");
+                    + "short-circuiting it, so the UDF's own null behaviour would have to be compiled, which this backend cannot do");
         }
 
         PrimitiveKind outputKind = PrimitiveKind.ofSparkType(outputType);
@@ -232,15 +258,49 @@ public final class UdfEligibilityAnalyzer {
         }
 
         boolean[] needsErrorReporting = { false };
-        String problem = walkReachableMethods(udf, inputs, canReportArithmeticErrors, needsErrorReporting);
+        String problem = walkReachableMethods(udf, inputs, canReportArithmeticErrors, needsErrorReporting, nullAware);
         if (problem != null) {
             return EligibilityResult.ineligible(problem);
+        }
+        if (nullAware) {
+            // The compilation itself is the remaining gate. TC refuses a null-aware method that does
+            // something it cannot give a null meaning to -- comparing two boxes with equals, for
+            // instance -- and that refusal arrives at planning time, as a CPU fallback.
+            return EligibilityResult.eligibleNullAware(udf, inputs, outputKind, needsErrorReporting[0]);
         }
         return needsErrorReporting[0] ? EligibilityResult.eligibleWithArithmeticErrors(udf, inputs, outputKind) : EligibilityResult.eligible(udf, inputs, outputKind);
     }
 
+    /**
+     * Whether the UDF's own method mentions null: loads one, or branches on one.
+     *
+     * <p>
+     * Only the entry method is looked at, because only the entry method has boxed parameters. A
+     * helper's arguments are primitives by the time it is called -- {@link #checkHelperSignature}
+     * insists on it -- so a helper cannot be handed a null to test.
+     * </p>
+     */
+    private static boolean entryTestsForNull(ResolvedUdf udf) {
+        ClassNode classNode = new ClassNode();
+        new ClassReader(udf.classFile()).accept(classNode, ClassReader.SKIP_FRAMES);
+        MethodNode entry = find(classNode, udf.method().getName() + Type.getMethodDescriptor(udf.method()));
+        if (entry == null) {
+            return false;
+        }
+        for (AbstractInsnNode insn : entry.instructions) {
+            switch (insn.getOpcode()) {
+                case Opcodes.ACONST_NULL, Opcodes.IFNULL, Opcodes.IFNONNULL -> {
+                    return true;
+                }
+                default -> {
+                }
+            }
+        }
+        return false;
+    }
+
     /** Walks every method the UDF can reach inside its own class; returns the first problem or null. */
-    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
+    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs, boolean canReportArithmeticErrors, boolean[] needsErrorReporting, boolean nullAware) {
         ClassNode classNode = new ClassNode();
         new ClassReader(udf.classFile()).accept(classNode, ClassReader.SKIP_FRAMES);
         String owner = classNode.name;
@@ -277,7 +337,7 @@ public final class UdfEligibilityAnalyzer {
             }
             Set<Integer> referenceSlots = isEntry ? parameterSlots(method, inputs) : Set.of();
             String problem = checkInstructions(method, classNode, pending, seen, key, callGraph, referenceSlots,
-                    isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none(), canReportArithmeticErrors, needsErrorReporting);
+                    isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none(), canReportArithmeticErrors, needsErrorReporting, nullAware && isEntry);
             if (problem != null) {
                 return problem;
             }
@@ -411,7 +471,8 @@ public final class UdfEligibilityAnalyzer {
             Opcodes.IRETURN, Opcodes.LRETURN, Opcodes.FRETURN, Opcodes.DRETURN);
 
     private static String checkInstructions(MethodNode method, ClassNode classNode, Deque<String> pending, Set<String> seen, String self,
-            Map<String, Set<String>> callGraph, Set<Integer> referenceSlots, ArrayParameters arrays, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
+            Map<String, Set<String>> callGraph, Set<Integer> referenceSlots, ArrayParameters arrays, boolean canReportArithmeticErrors, boolean[] needsErrorReporting,
+            boolean nullAware) {
         String arrayProblem = arrays.check(method);
         if (arrayProblem != null) {
             return arrayProblem;
@@ -456,12 +517,26 @@ public final class UdfEligibilityAnalyzer {
                     }
                 }
                 case Opcodes.ARETURN -> {
-                    // Safe only because ACONST_NULL is refused below and the declared return type
-                    // was matched against the column's type: the value returned is the boxed result.
+                    // Over a non-nullable column this is safe only because ACONST_NULL is refused
+                    // below and the declared return type was matched against the column's: what is
+                    // returned is the boxed result. Over a nullable one it may also be a null, which
+                    // is a null in the output column.
                 }
-                case Opcodes.ACONST_NULL ->
-                    { return "the UDF can return or use null, which a kernel column has no representation for"; }
-                case Opcodes.IF_ACMPEQ, Opcodes.IF_ACMPNE, Opcodes.IFNULL, Opcodes.IFNONNULL ->
+                case Opcodes.ACONST_NULL -> {
+                    if (!nullAware) {
+                        return "the UDF can return or use null, which a kernel column has no representation for";
+                    }
+                    // Null-aware: the output is a cuda::std::optional, so a null has a representation.
+                }
+                case Opcodes.IFNULL, Opcodes.IFNONNULL -> {
+                    if (!nullAware) {
+                        return "the UDF compares references, which is identity rather than arithmetic and has no kernel meaning";
+                    }
+                    // Null-aware: `x == null` is has_value(), which is the whole point of the mode.
+                    // IF_ACMPEQ/NE stay refused below -- comparing two boxes is identity, and Java's
+                    // own answer for it depends on the Integer cache rather than on the numbers.
+                }
+                case Opcodes.IF_ACMPEQ, Opcodes.IF_ACMPNE ->
                     { return "the UDF compares references, which is identity rather than arithmetic and has no kernel meaning"; }
                 case Opcodes.NEW, Opcodes.NEWARRAY, Opcodes.ANEWARRAY, Opcodes.MULTIANEWARRAY ->
                     { return "the UDF allocates an object or an array, which a kernel cannot do"; }

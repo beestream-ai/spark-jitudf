@@ -102,6 +102,29 @@ fi
 # override, or to empty to leave the fork's default alone.
 DRIVER_OPTS="$DRIVER_OPTS -Dspark.rapids.sql.tornadovm.provider=${JITUDF_PROVIDER-ai.beestream.jitudf.TornadoUdfProvider}"
 
+# A locally built cuDF carries a version string that is deliberately not NVIDIA's, so that its jar
+# can never be mistaken for the released one. RAPIDS checks that string against the version it was
+# built for and refuses to start when they differ -- which is the right default, and exactly the
+# case this integration creates on purpose. spark.rapids.cudfVersionOverride is RAPIDS's own switch
+# for it.
+#
+# Set only when the jar really does carry a non-released cuDF, read out of the jar rather than
+# assumed: a stock run must keep the check, because there a mismatch means something is wrong.
+CUDF_IN_JAR=$(unzip -p "$RAPIDS_JAR" cudf-java-version-info.properties 2>/dev/null | sed -n 's/^version=//p' || true)
+if [ -n "$CUDF_IN_JAR" ] && [ "$CUDF_IN_JAR" != "${CUDF_RELEASED_VERSION:-26.08.0}" ]; then
+  echo "note: this RAPIDS jar carries cudf $CUDF_IN_JAR, not the released ${CUDF_RELEASED_VERSION:-26.08.0};"
+  echo "      enabling spark.rapids.cudfVersionOverride so the plugin will start against it"
+  DRIVER_OPTS="$DRIVER_OPTS -Dspark.rapids.cudfVersionOverride=true"
+fi
+
+# NATIVE_UDF_JAR names NVIDIA's native cosine-similarity example, which most runs do not have.
+# Passing a path that does not exist makes Spark log an ERROR and carry on, which puts a stack
+# trace at the top of every log for something nothing in the run needed.
+NATIVE_UDF_ARG=""
+if [ -n "${NATIVE_UDF_JAR:-}" ] && [ -f "$NATIVE_UDF_JAR" ]; then
+  NATIVE_UDF_ARG=",$NATIVE_UDF_JAR"
+fi
+
 set +e
 # PROFILE_WRAP lets a profiler (nsys, ncu) wrap the whole submit without a second copy of this
 # launcher. Unset by default, so an ordinary run is byte-for-byte the command it always was; a
@@ -118,7 +141,7 @@ DRIVER_OPTS="$DRIVER_OPTS -Dapp.repoRoot=$ROOT -Dapp.integrationJar=$PLUGIN_JAR 
 ${PROFILE_WRAP:-} "$SPARK_HOME/bin/spark-submit" \
   --master "$EFFECTIVE_MASTER" \
   --class "$CLASS" \
-  --jars "$RAPIDS_JAR,$PLUGIN_JAR${NATIVE_UDF_JAR:+,$NATIVE_UDF_JAR}" \
+  --jars "$RAPIDS_JAR,$PLUGIN_JAR$NATIVE_UDF_ARG" \
   --conf spark.driver.memory=6g \
   --driver-java-options "$DRIVER_OPTS" \
   "${SUBMIT_JAR:-$BENCH_JAR}" "$@"

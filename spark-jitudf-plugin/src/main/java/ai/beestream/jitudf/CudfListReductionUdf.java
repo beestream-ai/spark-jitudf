@@ -20,6 +20,7 @@ import java.io.Serializable;
 import ai.rapids.cudf.ColumnVector;
 import ai.rapids.cudf.ColumnView;
 import ai.rapids.cudf.DType;
+import ai.rapids.cudf.OutputNullability;
 import ai.rapids.cudf.SegmentedReductionAggregation;
 
 import com.nvidia.spark.RapidsUDF;
@@ -90,7 +91,9 @@ public final class CudfListReductionUdf implements RapidsUDF, Serializable {
         // are ours and are closed here. The reduction's result is what this method returns, so it is
         // the one thing not closed.
         try (ColumnView child = list.getChildColumnView(0)) {
-            try (ColumnVector mapped = child.transform(elementCuda, false)) {
+            // The generalized binding, so that the element function may produce something other than
+            // INT32: listReduce is then asked for the same type, and the sum stays in it.
+            try (ColumnVector mapped = ColumnView.transform(new ColumnView[] { child }, elementCuda, false, resultKind.cudfType(), false, OutputNullability.PRESERVE)) {
                 try (ColumnView rebuilt = list.replaceChildrenWithViews(new int[] { 0 }, new ColumnView[] { mapped })) {
                     return rebuilt.listReduce(SegmentedReductionAggregation.sum(), resultKind.cudfType());
                 }

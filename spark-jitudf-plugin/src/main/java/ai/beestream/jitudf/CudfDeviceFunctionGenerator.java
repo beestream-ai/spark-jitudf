@@ -144,6 +144,80 @@ public final class CudfDeviceFunctionGenerator {
         return new Generated(internalName.replace('/', '.'), internalName, writer.toByteArray(), entryDescriptor, BODY_METHOD, AsmUdfLowering.descriptorOf(inputs, outputKind));
     }
 
+    public static final String BOXED_BODY_METHOD = "udfNullable";
+
+    /**
+     * The class TC compiles for a <em>nullable</em> column, in its null-aware mode.
+     *
+     * <p>
+     * {@link #generate} erases the UDF's boxing on the way to a kernel over values that are known
+     * to be present. That is exactly wrong when a column has nulls, because the boxes are where the
+     * nulls live: Spark does not short-circuit a null for a Java UDF -- {@code inputPrimitives} is
+     * false for every boxed parameter -- so it calls the method with the null and the method's own
+     * answer is the SQL answer. Here the method is therefore carried over unchanged apart from
+     * losing its receiver, and TC's null-aware mode compiles the boxes into
+     * {@code cuda::std::optional}s.
+     * </p>
+     *
+     * <p>
+     * There is no {@code cudfEntry} wrapper in this shape. {@code TcCompiler.compileDeviceFunction}
+     * derives the {@code cuda::std::optional<R> *out} parameter from the return type, and the
+     * function returns an error code rather than nothing, so what is generated is just the method.
+     * </p>
+     */
+    public static Generated generateNullAware(ResolvedUdf udf, List<InputSpec> inputs, String identity) {
+        for (InputSpec input : inputs) {
+            if (input.isList()) {
+                throw new IllegalArgumentException("a LIST argument cannot be compiled for cudf::transform, which takes only fixed-width and string inputs");
+            }
+        }
+
+        ClassNode source = new ClassNode();
+        new ClassReader(udf.classFile()).accept(source, ClassReader.SKIP_FRAMES);
+
+        String methodDescriptor = org.objectweb.asm.Type.getMethodDescriptor(udf.method());
+        MethodNode userMethod = null;
+        for (MethodNode method : source.methods) {
+            if (method.name.equals(udf.method().getName()) && method.desc.equals(methodDescriptor)) {
+                userMethod = method;
+                break;
+            }
+        }
+        if (userMethod == null) {
+            throw new IllegalStateException("the UDF method " + udf.method() + " is not in the class file it came from");
+        }
+        boolean isStatic = (userMethod.access & Opcodes.ACC_STATIC) != 0;
+
+        String simpleName = sanitize(udf.declaringClass().getSimpleName()) + "$N" + KernelIdentity.shortForm(identity);
+        String internalName = PACKAGE + simpleName;
+
+        MethodNode body = BoxedUdfLowering.lower(userMethod, BOXED_BODY_METHOD, isStatic);
+        List<MethodNode> helpers = AsmUdfLowering.reachableHelpers(source.methods, userMethod, source.name);
+
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES) {
+            @Override
+            protected String getCommonSuperClass(String first, String second) {
+                return first.equals(second) ? first : "java/lang/Object";
+            }
+        };
+        writer.visit(Opcodes.V21, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER, internalName, null, "java/lang/Object", null);
+        emitConstructor(writer);
+
+        retargetOwner(body, source.name, internalName);
+        body.accept(writer);
+        for (MethodNode helper : helpers) {
+            if ((helper.access & Opcodes.ACC_STATIC) == 0) {
+                throw new IllegalStateException("the UDF calls the instance method " + helper.name + ", which the analysis should have refused");
+            }
+            MethodNode copy = new MethodNode(Opcodes.ASM9, (helper.access & ~Opcodes.ACC_PUBLIC) | Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC, helper.name, helper.desc, null, null);
+            helper.accept(copy);
+            retargetOwner(copy, source.name, internalName);
+            copy.accept(writer);
+        }
+        writer.visitEnd();
+        return new Generated(internalName.replace('/', '.'), internalName, writer.toByteArray(), body.desc, BOXED_BODY_METHOD, body.desc);
+    }
+
     /**
      * Builds an entry class around an already-lowered element method, for the list-reduction path.
      *

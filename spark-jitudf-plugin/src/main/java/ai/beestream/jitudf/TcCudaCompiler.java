@@ -148,6 +148,64 @@ public final class TcCudaCompiler {
     }
 
     /**
+     * Compiles a nullable UDF: TC's null-aware mode, for {@code cudf::transform} with
+     * {@code null_aware::YES}.
+     *
+     * <p>
+     * What changes is the whole signature. Each input arrives as a {@code cuda::std::optional}, the
+     * output is written through a {@code cuda::std::optional<R> *}, and the function returns an
+     * {@code int} error code rather than nothing:
+     * </p>
+     *
+     * <pre>
+     * #include &lt;cuda/std/optional&gt;
+     * __device__ int GENERIC_TRANSFORM_OP(cuda::std::optional&lt;int&gt; *out, cuda::std::optional&lt;long long&gt; v_opt)
+     * </pre>
+     *
+     * <p>
+     * That is the shape libcudf's kernel calls in its null-aware branch: it reads each input with
+     * {@code nullable_element}, hands the function an {@code optional} output to fill, and takes
+     * the output column's validity from {@code has_value()} afterwards. So the UDF's own answer for
+     * a null -- a number, or a null -- is what lands in the column, which is the only way to be
+     * right about a Java UDF, whose parameters are boxed and which Spark therefore calls <em>with</em>
+     * the null rather than short-circuiting it.
+     * </p>
+     *
+     * <p>
+     * A null the method unboxes without checking is Java's {@code NullPointerException}; TC emits
+     * error code 3 for it. cudf only names 0, 1 and 2 ({@code SUCCESS}, {@code OVERFLOW},
+     * {@code DIVISION_BY_ZERO}), so 3 is reported as {@code UNKNOWN_ERROR}: the query fails, as it
+     * would on the CPU, but the exception is not reproduced.
+     * </p>
+     *
+     * @param reportArithmeticErrors
+     *         also compile with {@code --errors}, for a UDF whose divisor cannot be proved non-zero
+     *         or which calls {@code Math.*Exact}. Null-awareness alone does not admit those.
+     */
+    public static Result compileNullAware(CudfDeviceFunctionGenerator.Generated generated, List<InputSpec> inputs, ClassLoader userLoader, boolean reportArithmeticErrors) {
+        CompositeBytecodeSource source = new CompositeBytecodeSource(userLoader).with(generated.internalName(), generated.classFile());
+
+        TcOptions options = TcOptions.DEFAULTS.withNullAwareDeviceFunction(true).withDeviceFunctionErrors(reportArithmeticErrors);
+
+        TcCompiler.Compilation compilation;
+        try {
+            compilation = TcCompiler.compileDeviceFunction(source, generated.className(), generated.bodyMethod(), generated.bodyDescriptor(), target(), options);
+        } catch (RuntimeException | LinkageError e) {
+            return Result.refused("the CUDA compiler failed unexpectedly: " + e);
+        }
+        if (!compilation.succeeded()) {
+            return Result.refused("TornadoVM's compiler declined the nullable UDF: " + describe(compilation));
+        }
+
+        String cuda = renameEntry(compilation.source(), compilation.entryName());
+        String refusal = CudaSourceCheck.check(cuda, ENTRY_SYMBOL, inputs.size());
+        if (refusal != null) {
+            return Result.refused(refusal);
+        }
+        return new Result(cuda, ENTRY_SYMBOL, null);
+    }
+
+    /**
      * What the generated code is compiled for.
      *
      * <p>

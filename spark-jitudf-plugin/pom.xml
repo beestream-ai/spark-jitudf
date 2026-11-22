@@ -38,6 +38,15 @@
       <artifactId>spark-sql_${scala.binary.version}</artifactId>
       <scope>provided</scope>
     </dependency>
+    <!-- Ahead of rapids-4-spark on purpose. Both jars carry ai.rapids.cudf, and only this one
+         has the generalized ColumnView.transform; declaring it first makes the compiler and the
+         tests see the wider API rather than the copy bundled in the RAPIDS distribution. -->
+    <dependency>
+      <groupId>com.nvidia</groupId>
+      <artifactId>spark-rapids-jni</artifactId>
+      <classifier>${cudf.jni.classifier}</classifier>
+      <scope>provided</scope>
+    </dependency>
     <dependency>
       <groupId>com.nvidia</groupId>
       <artifactId>rapids-4-spark_${scala.binary.version}</artifactId>

@@ -21,6 +21,8 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.api.java.UDF1;
+import org.apache.spark.sql.api.java.UDF2;
+import org.apache.spark.sql.api.java.UDF3;
 import org.apache.spark.sql.types.DataTypes;
 
 import ai.beestream.jitudf.TornadoUdfProvider;
@@ -163,8 +165,112 @@ public final class CudfTransformIntegrationTest {
         }
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Several inputs, typed outputs, and nullable columns: the three the widened binding adds.
+    // -----------------------------------------------------------------------------------------
+
+    /** Two INT32 columns and an INT32 result, with a loop so this is not a Catalyst expression. */
+    public static final class TwoIntUdf implements UDF2<Integer, Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer a, Integer b) {
+            int acc = a;
+            for (int i = 0; i < 8; i++) {
+                acc = acc * 31 + b + i;
+            }
+            return acc;
+        }
+    }
+
+    /** INT32 and FLOAT32 in, FLOAT64 out: three different widths in one call. */
+    public static final class MixedWidthUdf implements UDF2<Integer, Float, Double> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Double call(Integer a, Float b) {
+            // sqrt is correctly rounded on both sides, and the sum of exact values is exact, so
+            // the comparison against CPU Spark is equality rather than a tolerance.
+            return Math.sqrt(a.doubleValue() * a.doubleValue() + b.doubleValue() * b.doubleValue());
+        }
+    }
+
+    /** Three fixed-width inputs of three types, and an INT64 result. */
+    public static final class ThreeInputUdf implements UDF3<Long, Integer, Double, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Long a, Integer b, Double c) {
+            long acc = a;
+            for (int i = 0; i < 6; i++) {
+                acc = acc * 31 + b + c.longValue();
+            }
+            return acc;
+        }
+    }
+
+    /** One INT64 in, one INT64 out: a result that does not fit the old INT32-only binding. */
+    public static final class LongMixUdf implements UDF1<Long, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Long v) {
+            long z = v;
+            for (int i = 0; i < 4; i++) {
+                z ^= z >>> 30;
+                z *= 0xBF58476D1CE4E5B9L;
+            }
+            return z ^ (z >>> 27);
+        }
+    }
+
+    /** Answers for a null instead of propagating it: a mask copy would get every null row wrong. */
+    public static final class DefaultingUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long value) {
+            if (value == null) {
+                return -1;
+            }
+            return value.intValue();
+        }
+    }
+
+    /** Returns null for a null input, and also for a non-null input it rejects. */
+    public static final class NullableResultUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long value) {
+            if (value == null) {
+                return null;
+            }
+            if ((value & 1L) == 1L) {
+                return null;
+            }
+            return (int) (value / 2L);
+        }
+    }
+
+    /** Two nullable columns, either of which may be absent on any given row. */
+    public static final class CoalescingUdf implements UDF2<Long, Integer, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Long a, Integer b) {
+            if (a == null && b == null) {
+                return null;
+            }
+            long av = a == null ? 0L : a;
+            long bv = b == null ? 0L : b.longValue();
+            return av * 3L + bv;
+        }
+    }
+
     public static void main(String[] args) {
         int rows = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
+        configuredRows = rows;
 
         // Chosen before Spark starts: the provider reads it when it compiles.
         System.setProperty("tornado.spark.backend", TornadoUdfProvider.BACKEND_CUDF_TRANSFORM);
@@ -179,6 +285,13 @@ public final class CudfTransformIntegrationTest {
             spark.udf().register("cudf_digit_sum", new DigitSumUdf(), DataTypes.IntegerType);
             spark.udf().register("cudf_var_div", new VariableDivisorUdf(), DataTypes.IntegerType);
             spark.udf().register("cudf_zero_div", new ZeroDivisorUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_two_int", new TwoIntUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_mixed_width", new MixedWidthUdf(), DataTypes.DoubleType);
+            spark.udf().register("cudf_three_input", new ThreeInputUdf(), DataTypes.LongType);
+            spark.udf().register("cudf_long_mix", new LongMixUdf(), DataTypes.LongType);
+            spark.udf().register("cudf_defaulting", new DefaultingUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_nullable_result", new NullableResultUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_coalescing", new CoalescingUdf(), DataTypes.LongType);
 
             runCase(spark, "C1-collatz-loop", "cudf_collatz", rows);
             runCase(spark, "C2-activity-bitmap", "cudf_active_days", rows);
@@ -188,6 +301,18 @@ public final class CudfTransformIntegrationTest {
             runCase(spark, "C5-integer-division", "cudf_digit_sum", rows);
             runCase(spark, "C6-variable-divisor", "cudf_var_div", rows);
             runZeroDivisorCase(spark, rows);
+
+            // Several input columns.
+            runValueCase(spark, "C8-two-int-inputs", "cudf_two_int", "cudf_two_int(a, b)", false);
+            runValueCase(spark, "C9-mixed-widths-to-float64", "cudf_mixed_width", "cudf_mixed_width(a, f)", false, true);
+            runValueCase(spark, "C10-three-inputs-to-int64", "cudf_three_input", "cudf_three_input(c, a, d)", false, true);
+            // An output type the old binding could not ask for.
+            runValueCase(spark, "C11-int64-output", "cudf_long_mix", "cudf_long_mix(c)", false);
+            // Nullable columns, through TC's null-aware mode.
+            runValueCase(spark, "C12-nullable-in-non-null-out", "cudf_defaulting", "cudf_defaulting(nseed)", true);
+            runValueCase(spark, "C13-nullable-in-nullable-out", "cudf_nullable_result", "cudf_nullable_result(nseed)", true);
+            runValueCase(spark, "C14-two-nullable-inputs", "cudf_coalescing", "cudf_coalescing(nseed, nb)", true);
+
             checkProviderProducedCuda();
             printDecisions();
         } finally {
@@ -290,6 +415,130 @@ public final class CudfTransformIntegrationTest {
         check("C7-divide-by-zero: the GPU path fails it too, rather than answering", gpuFailed, "the GPU produced a result where the CPU raised");
     }
 
+    /**
+     * Columns for the multi-input cases, all of them non-nullable.
+     *
+     * <p>
+     * Built from {@code &}, {@code *} and {@code +} only. Spark's {@code %} is nullable, because
+     * it yields null rather than raising for a zero divisor, and one nullable column would send
+     * these cases down the null-aware path instead of the one they are meant to exercise.
+     * </p>
+     */
+    private static Dataset<Row> wideData(SparkSession spark, int rows) {
+        return spark.range(1, rows + 1L, 1, 2).selectExpr(
+                "id",
+                "cast(id & 1023 as int) as a",
+                "cast((id >> 3) & 255 as int) as b",
+                "id * 7 + 1 as c",
+                "cast(id & 15 as float) as f",
+                "cast(id & 31 as double) + 0.5 as d");
+    }
+
+    /**
+     * The same rows with nulls in them: one value in eight absent from {@code nseed}, one in four
+     * from {@code nb}, so every combination of present and absent occurs.
+     */
+    private static Dataset<Row> nullableData(SparkSession spark, int rows) {
+        return spark.range(1, rows + 1L, 1, 2).selectExpr(
+                "id",
+                "case when (id & 7) = 0 then null else id * 7 + 1 end as nseed",
+                "case when (id & 3) = 0 then null else cast(id & 1023 as int) end as nb");
+    }
+
+    /**
+     * One workload, compared value by value against CPU Spark and checked for the GPU path.
+     *
+     * <p>
+     * The comparison is {@link java.util.Objects#equals} on the boxed values rather than a typed
+     * getter, so a null on one side and a number on the other is a mismatch rather than an
+     * exception -- which is the thing these cases exist to detect. For the floating-point cases the
+     * values compared are exact: the device function is compiled strict (no contracted
+     * multiply-adds) and {@code sqrt} is correctly rounded on both sides.
+     * </p>
+     */
+    private static void runValueCase(SparkSession spark, String label, String udf, String call, boolean nullable) {
+        runValueCase(spark, label, udf, call, nullable, false);
+    }
+
+    /**
+     * @param floatingPoint
+     *        whether the UDF touches float or double, in which case RAPIDS's own opt-in for
+     *        operations that may not match Spark's CPU bit for bit has to be set. The plugin
+     *        refuses such a UDF without it, deliberately: TornadoVM's CUDA backend is allowed to
+     *        contract a multiply and an add into an fma, and Java is not, so a result can differ in
+     *        the last ulp. The comparison below is still exact equality -- a device function is
+     *        compiled strict, so no contraction happens on this path -- but the gate is about what
+     *        may happen, not about what did, and turning it off here would be deciding that for
+     *        every user.
+     */
+    private static void runValueCase(SparkSession spark, String label, String udf, String call, boolean nullable, boolean floatingPoint) {
+        System.out.println();
+        System.out.println("--- " + label + " ---");
+        String previous = spark.conf().get("spark.rapids.sql.incompatibleOps.enabled", "false");
+        if (floatingPoint) {
+            spark.conf().set("spark.rapids.sql.incompatibleOps.enabled", "true");
+        }
+        try {
+            runValueCaseBody(spark, label, udf, call, nullable);
+        } finally {
+            spark.conf().set("spark.rapids.sql.incompatibleOps.enabled", previous);
+        }
+    }
+
+    private static void runValueCaseBody(SparkSession spark, String label, String udf, String call, boolean nullable) {
+
+        List<Row> cpu = collectCall(spark, rowsOf(spark, nullable), call, false);
+        List<Row> gpu = collectCall(spark, rowsOf(spark, nullable), call, true);
+
+        check(label + ": row count", cpu.size() == gpu.size(), cpu.size() + " vs " + gpu.size());
+        int mismatches = 0;
+        int nulls = 0;
+        for (int i = 0; i < Math.min(cpu.size(), gpu.size()); i++) {
+            Object expected = cpu.get(i).get(1);
+            Object actual = gpu.get(i).get(1);
+            if (expected == null) {
+                nulls++;
+            }
+            if (!java.util.Objects.equals(expected, actual)) {
+                if (mismatches++ < 3) {
+                    System.out.println("  row " + i + ": cpu=" + expected + " gpu=" + actual);
+                }
+            }
+        }
+        check(label + ": every row identical to CPU Spark", mismatches == 0, mismatches + " rows differ");
+        if (nullable) {
+            // Without this the "identical" check above could pass on a column that happens to have
+            // no nulls at all, which would say nothing about null handling.
+            check(label + ": CPU Spark really produced nulls to match", nulls > 0 || label.contains("non-null-out"),
+                    "no null rows in the reference, so the comparison proves nothing about nulls");
+        }
+
+        String plan = planFor(spark, rowsOf(spark, nullable), call);
+        check(label + ": the UDF itself runs on the GPU", plan.contains("gpu_" + udf), firstLines(plan));
+        check(label + ": no CPU fallback for the UDF", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+    }
+
+    /** The row count the session was built with, so the two datasets stay the same size. */
+    private static int configuredRows = 0;
+
+    private static Dataset<Row> rowsOf(SparkSession spark, boolean nullable) {
+        return nullable ? nullableData(spark, configuredRows) : wideData(spark, configuredRows);
+    }
+
+    private static List<Row> collectCall(SparkSession spark, Dataset<Row> source, String call, boolean enabled) {
+        spark.conf().set("spark.rapids.sql.tornadovm.enabled", String.valueOf(enabled));
+        spark.conf().set("spark.rapids.sql.enabled", String.valueOf(enabled));
+        return source.selectExpr("id", call + " as result").orderBy("id").collectAsList();
+    }
+
+    private static String planFor(SparkSession spark, Dataset<Row> source, String call) {
+        spark.conf().set("spark.rapids.sql.tornadovm.enabled", "true");
+        spark.conf().set("spark.rapids.sql.enabled", "true");
+        Dataset<Row> df = source.selectExpr("id", call + " as result");
+        df.collect();
+        return df.queryExecution().executedPlan().toString();
+    }
+
     /** Whether the query throws, which is what both paths are supposed to do here. */
     private static boolean failsWith(SparkSession spark, int rows, String udf, boolean enabled) {
         try {
@@ -336,7 +585,11 @@ public final class CudfTransformIntegrationTest {
         System.out.println();
         System.out.println("--- backend ---");
         long viaCudf = TornadoUdfProvider.decisions().values().stream().filter(d -> d.contains("cudf-transform")).count();
-        check("the provider compiled through cudf::transform", viaCudf >= 4, "decisions: " + TornadoUdfProvider.decisions());
+        check("the provider compiled through cudf::transform", viaCudf >= 13, "decisions: " + TornadoUdfProvider.decisions());
+        long viaNullAware = TornadoUdfProvider.decisions().values().stream().filter(d -> d.contains("null-aware")).count();
+        // The three nullable cases must have gone through the null-aware compilation, not through
+        // some other route that happens to produce the right numbers.
+        check("the nullable columns were compiled null-aware", viaNullAware >= 3, "decisions: " + TornadoUdfProvider.decisions());
     }
 
     private static void printDecisions() {

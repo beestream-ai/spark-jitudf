@@ -18,6 +18,8 @@ package ai.beestream.jitudf;
 import java.io.Serializable;
 
 import ai.rapids.cudf.ColumnVector;
+import ai.rapids.cudf.ColumnView;
+import ai.rapids.cudf.OutputNullability;
 
 import com.nvidia.spark.RapidsUDF;
 
@@ -41,11 +43,19 @@ import com.nvidia.spark.RapidsUDF;
  * </p>
  *
  * <p>
- * <strong>Arity.</strong> cuDF's Java binding currently takes exactly one input column and always
- * produces INT32 ({@code ColumnView.transform}); libcudf itself has taken several inputs and a
- * chosen output type for some time, and widening the binding is the small JNI change NVIDIA
- * describes as its own opportunity. Until that lands, a UDF outside this shape is refused while
- * planning rather than failed here.
+ * <strong>Arity, output type and nulls.</strong> This calls the generalized binding --
+ * {@code ColumnView.transform(ColumnView[], String, boolean, DType, boolean, OutputNullability)} --
+ * which takes any number of input columns, produces the type asked for, and can run the function
+ * over nullable inputs. That is NVIDIA's opportunity #2, and libcudf had all three of those
+ * capabilities already: what was missing was only the Java and JNI surface to reach them.
+ * </p>
+ *
+ * <p>
+ * The output nullability is always {@code PRESERVE}, never {@code ALL_VALID}. {@code ALL_VALID}
+ * asserts that the function produces a value for every row, and for a null-aware function this
+ * integration has no way to establish that -- it would have to prove the user's method never
+ * returns null. {@code PRESERVE} costs a validity mask that may turn out to be all ones; being
+ * wrong the other way is undefined behaviour.
  * </p>
  */
 public final class CudfTransformUdf implements RapidsUDF, Serializable {
@@ -56,38 +66,44 @@ public final class CudfTransformUdf implements RapidsUDF, Serializable {
     private final String udfName;
     private final PrimitiveKind outputKind;
     private final int inputCount;
+    private final boolean nullAware;
 
     public CudfTransformUdf(String cudaSource, String udfName, PrimitiveKind outputKind, int inputCount) {
+        this(cudaSource, udfName, outputKind, inputCount, false);
+    }
+
+    public CudfTransformUdf(String cudaSource, String udfName, PrimitiveKind outputKind, int inputCount, boolean nullAware) {
         this.cudaSource = cudaSource;
         this.udfName = udfName;
         this.outputKind = outputKind;
         this.inputCount = inputCount;
+        this.nullAware = nullAware;
     }
 
     public String cudaSource() {
         return cudaSource;
     }
 
+    /** Whether the device function takes and returns {@code cuda::std::optional}s. */
+    public boolean nullAware() {
+        return nullAware;
+    }
+
     @Override
     public ColumnVector evaluateColumnar(int numRows, ColumnVector... args) {
         if (args.length != inputCount) {
+            // The source was compiled for exactly this many parameters, and cudf passes one value
+            // per column it is given, so a mismatch would bind arguments to the wrong parameters
+            // rather than fail. Checked here because the compilation and the call are far apart.
             throw new IllegalStateException("the kernel for " + udfName + " takes " + inputCount + " columns but was given " + args.length);
         }
-        if (args.length != 1) {
-            // Guarded at planning time; repeated here so that a future change to the planner cannot
-            // quietly produce a call this binding would mis-execute.
-            throw new IllegalStateException("cudf's transform binding takes one input column, but " + udfName + " has " + args.length);
-        }
-        if (outputKind != PrimitiveKind.INT) {
-            throw new IllegalStateException("cudf's transform binding produces INT32, but " + udfName + " returns " + outputKind.cudfType());
-        }
-        // The input is not closed here: it belongs to the caller. The result does not need closing
-        // either, because it is what this method returns.
-        return args[0].transform(cudaSource, false);
+        // The inputs are not closed here: they belong to the caller. The result does not need
+        // closing either, because it is what this method returns.
+        return ColumnView.transform(args, cudaSource, false, outputKind.cudfType(), nullAware, OutputNullability.PRESERVE);
     }
 
     @Override
     public String toString() {
-        return "CudfTransformUdf[" + udfName + ", " + inputCount + " inputs -> " + outputKind.cudfType() + "]";
+        return "CudfTransformUdf[" + udfName + ", " + inputCount + " inputs -> " + outputKind.cudfType() + (nullAware ? ", null-aware" : "") + "]";
     }
 }

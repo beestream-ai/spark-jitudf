@@ -49,6 +49,17 @@
     <spark.version>4.0.4</spark.version>
     <scala.binary.version>2.13</scala.binary.version>
     <rapids.version>26.08.1</rapids.version>
+    <!-- The cuDF JNI artifact. The released com.nvidia:spark-rapids-jni:26.08.0 carries a
+         ColumnView.transform that takes one input column and always produces INT32; the
+         multi-input, typed-output, null-aware form this integration calls is the widened binding,
+         built from NVIDIA's own pinned sources with our patch applied (see the cudf-spark fork's
+         upstream-patches/). It is published under a distinct version so that NVIDIA's released
+         26.08.0 is never overwritten, and so that a jar carrying the wider API cannot be confused
+         with one that does not. Build it with `mvn install` in a cudf-spark-jni checkout at the
+         pinned revision; `-Dcudf.jni.version=26.08.0` builds against the released one instead, with
+         the generalized calls left out of the compilation. -->
+    <cudf.jni.version>26.08.0-tcudf</cudf.jni.version>
+    <cudf.jni.classifier>cuda12</cudf.jni.classifier>
     <!-- The driver-side cuDF backend needs TcCompiler.compileDeviceFunction, which no release has
          yet: 8.1.0-jdk21 on Maven Central does not carry it. Until the next TornadoVM release this
          is a local `develop` install (`make` in a TornadoVM checkout installs it), and a build
@@ -80,6 +91,12 @@
         <groupId>org.apache.spark</groupId>
         <artifactId>spark-mllib_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.nvidia</groupId>
+        <artifactId>spark-rapids-jni</artifactId>
+        <version>${cudf.jni.version}</version>
+        <classifier>${cudf.jni.classifier}</classifier>
       </dependency>
       <dependency>
         <groupId>com.nvidia</groupId>

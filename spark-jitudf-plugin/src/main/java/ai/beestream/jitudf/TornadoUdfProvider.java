@@ -104,8 +104,12 @@ public final class TornadoUdfProvider {
             // The cudf backend can report an arithmetic error back to Spark (see TcCudaCompiler); the
             // runtime backend cannot, so only one of them may admit a divisor it cannot prove non-zero.
             boolean canReportArithmeticErrors = BACKEND_CUDF_TRANSFORM.equals(backend());
+            // And only the cudf backend can run a UDF over a nullable column: that needs both TC's
+            // null-aware mode and a binding that passes cuda::std::optionals, which is the widened
+            // ColumnView.transform. The TornadoVM runtime backend has neither and keeps refusing.
+            boolean canRunNullAware = BACKEND_CUDF_TRANSFORM.equals(backend());
             EligibilityResult eligibility = CompilePhases.time(CompilePhases.Phase.ANALYSE,
-                    () -> UdfEligibilityAnalyzer.analyse(resolvedUdf, List.of(inputTypes), outputType, inputsNullable, deterministic, canReportArithmeticErrors));
+                    () -> UdfEligibilityAnalyzer.analyse(resolvedUdf, List.of(inputTypes), outputType, inputsNullable, deterministic, canReportArithmeticErrors, canRunNullAware));
             if (!eligibility.isEligible()) {
                 return refuse(name, eligibility.reason());
             }
@@ -119,7 +123,7 @@ public final class TornadoUdfProvider {
                 // The key distinguishes the two compilations of the same UDF: with error reporting
                 // the entry returns a cudf error code instead of nothing, which is different source.
                 String key = KernelIdentity.of(resolvedUdf, eligibility.inputs(), eligibility.outputKind())
-                        + (eligibility.reportsArithmeticErrors() ? "+errc" : "");
+                        + (eligibility.reportsArithmeticErrors() ? "+errc" : "") + (eligibility.isNullAware() ? "+null" : "");
                 return cudfTransformUdf(name, resolvedUdf, eligibility, key);
             }
 
@@ -193,12 +197,13 @@ public final class TornadoUdfProvider {
      * Compiles the UDF to CUDA here on the driver and returns something that asks cuDF to run it.
      *
      * <p>
-     * The arity and output-type checks are not the compiler's limits -- it has just produced code
-     * for several inputs and any fixed-width output. They are {@code ColumnView.transform}'s: its
-     * JNI binding passes one input column and always asks for INT32. Widening that binding is a
-     * small change to cuDF that NVIDIA's own review lists as its opportunity #2; until it lands,
-     * anything outside the shape is refused while planning, which leaves the query exactly where it
-     * already was.
+     * There is no arity or output-type check left here. There used to be two, and they were not the
+     * compiler's limits but {@code ColumnView.transform}'s: its binding passed one input column and
+     * always asked for INT32. That binding has been widened -- NVIDIA's opportunity #2 -- so the
+     * shape the compiler already produced, several inputs and any fixed-width output, is now the
+     * shape cuDF can be asked to run. A LIST argument is still refused, because
+     * {@code cudf::transform} takes only fixed-width and string columns; a fold over a single list
+     * goes the other way, through a child transform and a segmented reduction.
      * </p>
      */
     private static Object cudfTransformUdf(String name, ResolvedUdf resolved, EligibilityResult eligibility, String cacheKey) {
@@ -211,11 +216,8 @@ public final class TornadoUdfProvider {
                 return refuse(name, "cudf::transform takes only fixed-width and string inputs, and this UDF has an array argument");
             }
         }
-        if (eligibility.inputs().size() != 1) {
-            return refuse(name, "cudf's transform binding takes one input column, and this UDF takes " + eligibility.inputs().size());
-        }
-        if (eligibility.outputKind() != PrimitiveKind.INT) {
-            return refuse(name, "cudf's transform binding produces INT32, and this UDF returns " + eligibility.outputKind().cudfType());
+        if (eligibility.inputs().isEmpty()) {
+            return refuse(name, "cudf::transform needs at least one input column, and this UDF takes none");
         }
         String semantics = SparkSemantics.refusalFor(eligibility.outputKind(), eligibility.inputs());
         if (semantics != null) {
@@ -227,22 +229,28 @@ public final class TornadoUdfProvider {
         // new session gets a new entry instead of silently reusing the old one's kernel.
         String cached = CUDA_CACHE.get(cacheKey);
         if (cached != null) {
-            DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform, cached): " + eligibility.inputs() + " -> " + eligibility.outputKind());
+            DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform" + (eligibility.isNullAware() ? ", null-aware" : "") + ", cached): "
+                    + eligibility.inputs() + " -> " + eligibility.outputKind());
             ACCEPTED.incrementAndGet();
             CACHE_HITS.incrementAndGet();
-            return new CudfTransformUdf(cached, name, eligibility.outputKind(), eligibility.inputs().size());
+            return new CudfTransformUdf(cached, name, eligibility.outputKind(), eligibility.inputs().size(), eligibility.isNullAware());
         }
 
+        boolean nullAware = eligibility.isNullAware();
         CudfDeviceFunctionGenerator.Generated generated;
         try {
             generated = CompilePhases.time(CompilePhases.Phase.GENERATE,
-                    () -> CudfDeviceFunctionGenerator.generate(resolved, eligibility.inputs(), eligibility.outputKind(), cacheKey));
+                    () -> nullAware
+                            ? CudfDeviceFunctionGenerator.generateNullAware(resolved, eligibility.inputs(), cacheKey)
+                            : CudfDeviceFunctionGenerator.generate(resolved, eligibility.inputs(), eligibility.outputKind(), cacheKey));
         } catch (RuntimeException e) {
             return refuse(name, "the cudf entry point could not be generated: " + e);
         }
 
         TcCudaCompiler.Result compiled = CompilePhases.time(CompilePhases.Phase.VERIFY,
-                () -> TcCudaCompiler.compile(generated, eligibility.inputs(), resolved.declaringClass().getClassLoader(), eligibility.reportsArithmeticErrors()));
+                () -> nullAware
+                        ? TcCudaCompiler.compileNullAware(generated, eligibility.inputs(), resolved.declaringClass().getClassLoader(), eligibility.reportsArithmeticErrors())
+                        : TcCudaCompiler.compile(generated, eligibility.inputs(), resolved.declaringClass().getClassLoader(), eligibility.reportsArithmeticErrors()));
         if (!compiled.ok()) {
             return refuse(name, compiled.refusal());
         }
@@ -251,9 +259,9 @@ public final class TornadoUdfProvider {
         if (CUDA_CACHE.size() < MAX_CACHED_KERNELS) {
             CUDA_CACHE.putIfAbsent(cacheKey, compiled.source());
         }
-        DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform): " + eligibility.inputs() + " -> " + eligibility.outputKind());
+        DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform" + (nullAware ? ", null-aware" : "") + "): " + eligibility.inputs() + " -> " + eligibility.outputKind());
         ACCEPTED.incrementAndGet();
-        return new CudfTransformUdf(compiled.source(), name, eligibility.outputKind(), eligibility.inputs().size());
+        return new CudfTransformUdf(compiled.source(), name, eligibility.outputKind(), eligibility.inputs().size(), nullAware);
     }
 
     /**
@@ -272,11 +280,6 @@ public final class TornadoUdfProvider {
         if (semantics != null) {
             return refuse(name, semantics);
         }
-        if (eligibility.outputKind() != PrimitiveKind.INT) {
-            // Inherited from the single-input binding the element transform uses.
-            return refuse(name, "cudf's transform binding produces INT32, and this list reduction returns " + eligibility.outputKind().cudfType());
-        }
-
         org.objectweb.asm.tree.MethodNode body;
         try {
             body = AsmUdfLowering.lower(userMethodOf(resolved), "udfBody", eligibility.inputs(), eligibility.outputKind(), isStatic(resolved));

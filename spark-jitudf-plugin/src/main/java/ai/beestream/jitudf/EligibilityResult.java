@@ -26,13 +26,19 @@ public final class EligibilityResult {
     private final PrimitiveKind outputKind;
     private final ResolvedUdf udf;
     private final boolean reportsArithmeticErrors;
+    private final boolean nullAware;
 
     private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf) {
-        this(eligible, reason, inputs, outputKind, udf, false);
+        this(eligible, reason, inputs, outputKind, udf, false, false);
     }
 
     private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf, boolean reportsArithmeticErrors) {
+        this(eligible, reason, inputs, outputKind, udf, reportsArithmeticErrors, false);
+    }
+
+    private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf, boolean reportsArithmeticErrors, boolean nullAware) {
         this.reportsArithmeticErrors = reportsArithmeticErrors;
+        this.nullAware = nullAware;
         this.eligible = eligible;
         this.reason = reason;
         this.inputs = inputs;
@@ -57,6 +63,20 @@ public final class EligibilityResult {
     /** Whether the compilation must report arithmetic errors, rather than assuming they cannot happen. */
     public boolean reportsArithmeticErrors() {
         return reportsArithmeticErrors;
+    }
+
+    /**
+     * Eligible over a nullable column: the UDF is compiled in TC's null-aware mode, so each input
+     * reaches it as a {@code cuda::std::optional} and its own answer for a null -- a value, a null,
+     * or an unboxing failure -- is what the output column gets.
+     */
+    public static EligibilityResult eligibleNullAware(ResolvedUdf udf, List<InputSpec> inputs, PrimitiveKind outputKind, boolean reportsArithmeticErrors) {
+        return new EligibilityResult(true, "", inputs, outputKind, udf, reportsArithmeticErrors, true);
+    }
+
+    /** Whether the device function takes and returns {@code cuda::std::optional}s. */
+    public boolean isNullAware() {
+        return nullAware;
     }
 
     public static EligibilityResult ineligible(String reason) {
@@ -85,6 +105,6 @@ public final class EligibilityResult {
 
     @Override
     public String toString() {
-        return eligible ? "TORNADOVM_ELIGIBLE(" + inputs + " -> " + outputKind + ")" : "TORNADOVM_INELIGIBLE(" + reason + ")";
+        return eligible ? "TORNADOVM_ELIGIBLE(" + inputs + (nullAware ? " nullable" : "") + " -> " + outputKind + ")" : "TORNADOVM_INELIGIBLE(" + reason + ")";
     }
 }
