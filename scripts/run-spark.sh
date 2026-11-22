@@ -94,6 +94,13 @@ else
   DRIVER_OPTS="$TORNADO_OPTS"
 fi
 
+# Which class RAPIDS calls as the UDF provider. The fallback hook in the cudf-spark fork still
+# defaults to the pre-Beestream class name, and that default is baked into the patched RAPIDS jar,
+# so without this the bridge finds nothing and every UDF quietly stays on the CPU -- the run still
+# produces correct results, which is exactly what makes it easy to miss. Naming the provider here
+# keeps this repository working against the published fork, rather than needing a change to it.
+DRIVER_OPTS="$DRIVER_OPTS -Dspark.rapids.sql.tornadovm.provider=${JITUDF_PROVIDER:-ai.beestream.jitudf.TornadoUdfProvider}"
+
 set +e
 # PROFILE_WRAP lets a profiler (nsys, ncu) wrap the whole submit without a second copy of this
 # launcher. Unset by default, so an ordinary run is byte-for-byte the command it always was; a

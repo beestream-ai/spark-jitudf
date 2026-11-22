@@ -78,7 +78,50 @@ public final class UdfEligibilityAnalyzer {
     private static final Set<String> SUPPORTED_MATH = Set.of( //
             "sqrt", "exp", "log", "log10", "sin", "cos", "tan", "tanh", "sinh", "cosh", //
             "asin", "acos", "atan", "atan2", "cbrt", "abs", "floor", "ceil", "rint", //
-            "pow", "min", "max", "fma", "signum", "hypot", "toRadians", "toDegrees");
+            "pow", "min", "max", "fma", "signum", "hypot", "toRadians", "toDegrees", //
+            // Integer division that rounds towards negative infinity. Not a device built-in and not
+            // in TornadoVM's intrinsic table either: these reach the GPU because TC follows the call
+            // into java.base and compiles the JDK's own body, so the semantics are Java's by
+            // construction rather than by a mapping someone has to keep correct.
+            "floorMod", "floorDiv");
+
+    /**
+     * Static {@code java.lang} methods that are compiled by inlining the JDK's own implementation.
+     *
+     * <p>
+     * None of these is in TornadoVM's intrinsic table. They work because TC resolves a call it does
+     * not recognise by reading the callee's bytecode, and every method here has a pure-arithmetic
+     * body in {@code java.base} -- no allocation, no exceptions, no state. {@code Long.bitCount}
+     * compiles to the JDK's own SWAR popcount; {@code Integer.rotateLeft} folds to a shift pair.
+     * </p>
+     *
+     * <p>
+     * They are listed explicitly rather than admitted by a rule, because "pure arithmetic in
+     * java.base" is not a property the analyser can check: it is a property of these specific
+     * bodies, which is why {@code CudfDeviceFunctionTest} compiles every one of them rather than
+     * assuming the list is right.
+     * </p>
+     *
+     * <p>
+     * Bit manipulation is not an arbitrary choice of extension. It is what the integer-bitmap UDFs
+     * in NVIDIA's customer survey are made of -- counting set days in a packed {@code long}, shifting
+     * a bitmap by a day -- and what a custom-seed Murmur3 bucketing UDF needs.
+     * </p>
+     */
+    private static final Set<String> SUPPORTED_JDK_STATICS = Set.of( //
+            "java/lang/Integer.bitCount(I)I", "java/lang/Integer.rotateLeft(II)I", "java/lang/Integer.rotateRight(II)I", //
+            "java/lang/Integer.reverse(I)I", "java/lang/Integer.reverseBytes(I)I", "java/lang/Integer.signum(I)I", //
+            "java/lang/Integer.numberOfLeadingZeros(I)I", "java/lang/Integer.numberOfTrailingZeros(I)I", //
+            "java/lang/Integer.highestOneBit(I)I", "java/lang/Integer.lowestOneBit(I)I", //
+            "java/lang/Long.bitCount(J)I", "java/lang/Long.rotateLeft(JI)J", "java/lang/Long.rotateRight(JI)J", //
+            "java/lang/Long.reverse(J)J", "java/lang/Long.reverseBytes(J)J", "java/lang/Long.signum(J)I", //
+            "java/lang/Long.numberOfLeadingZeros(J)I", "java/lang/Long.numberOfTrailingZeros(J)I", //
+            "java/lang/Long.highestOneBit(J)J", "java/lang/Long.lowestOneBit(J)J");
+
+    /** The methods of {@link #SUPPORTED_JDK_STATICS}, for the test that compiles each of them. */
+    static Set<String> supportedJdkStatics() {
+        return SUPPORTED_JDK_STATICS;
+    }
 
     private UdfEligibilityAnalyzer() {
     }
@@ -107,7 +150,20 @@ public final class UdfEligibilityAnalyzer {
             return EligibilityResult.ineligible("the UDF is not deterministic");
         }
         if (inputsNullable) {
-            return EligibilityResult.ineligible("an input column is nullable, and null handling is not implemented");
+            // Not "not implemented yet": the obvious implementation is unsound here, and the measurement
+            // is in bench/NullSemanticsProbe. Spark skips a UDF and yields null for a null argument only
+            // where it knows the argument to be primitive (ScalaUDF.inputPrimitives). A Java UDF1<Long,
+            // Integer> has a boxed parameter whatever the column is, so inputPrimitives is List(false)
+            // and Spark calls the UDF with the null. What happens then is the UDF's own business: a body
+            // that unboxes at once throws NullPointerException, and one that tests for null returns
+            // whatever it chooses, which is rarely null. Propagating the input's validity mask onto the
+            // output would silently replace both with null.
+            //
+            // Doing this properly means compiling the null test, which is TC's --null-aware mode: it
+            // takes cuda::std::optional arguments, and the transform binding we call cannot pass those.
+            // Until it can, a nullable column stays on the CPU, where it is correct.
+            return EligibilityResult.ineligible("an input column is nullable, and Spark passes a null argument to a UDF with a boxed parameter rather than "
+                    + "short-circuiting it, so the UDF's own null behaviour would have to be compiled");
         }
 
         PrimitiveKind outputKind = PrimitiveKind.ofSparkType(outputType);
@@ -524,6 +580,11 @@ public final class UdfEligibilityAnalyzer {
         if (isSupportedBox("L" + call.owner + ";")) {
             // Only the exact boxing and conversion calls the lowering can replace precisely.
             if (BoxConversions.isKnown(call)) {
+                return null;
+            }
+            // ... or a static whose JDK body the compiler inlines, which is a different thing: the
+            // lowering does not replace it at all, it is compiled from java.base's own bytecode.
+            if (call.getOpcode() == Opcodes.INVOKESTATIC && SUPPORTED_JDK_STATICS.contains(call.owner + "." + call.name + call.desc)) {
                 return null;
             }
             return "the UDF calls " + call.owner.replace('/', '.') + "." + call.name + call.desc

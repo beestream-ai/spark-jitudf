@@ -224,6 +224,13 @@ final class AsmUdfLowering {
             case Opcodes.INVOKESTATIC, Opcodes.INVOKEVIRTUAL -> {
                 MethodInsnNode call = (MethodInsnNode) insn;
                 if (BoxConversions.isSupportedBox(call.owner)) {
+                    // A static like Integer.rotateLeft or Long.bitCount shares an owner with the
+                    // boxing calls but is not one: there is nothing to erase, because the compiler
+                    // reaches it by inlining java.base's own bytecode. It is left exactly as it is.
+                    if (call.getOpcode() == Opcodes.INVOKESTATIC && UdfEligibilityAnalyzer.supportedJdkStatics().contains(call.owner + "." + call.name + call.desc)) {
+                        out.add(insn);
+                        return;
+                    }
                     // Exactly what this call did, by owner/name/descriptor: nothing for real
                     // packaging, the matching conversion opcode for a call that also converts.
                     // Erasing the second kind along with the first changes the answer.

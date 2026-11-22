@@ -216,6 +216,49 @@ class KernelGenerationTest {
         assertTrue(result.reason().contains("nullable"), result.reason());
     }
 
+    /**
+     * The refusal above is a semantic one, not a missing feature, and the reason has to say so: the
+     * tempting fix -- run the UDF over every row and put the input's validity mask on the output --
+     * is wrong for a Java UDF, because Spark hands it the null instead of short-circuiting. Pinned
+     * here so that nobody reads "not implemented" into it and implements the wrong thing.
+     * bench/NullSemanticsProbe is the measurement: inputPrimitives = List(false), an unboxing body
+     * throws NullPointerException, and a null-testing body returns its own value.
+     */
+    @Test
+    void theNullableRefusalSaysWhyRatherThanThatItIsUnimplemented() {
+        ResolvedUdf resolved = UdfResolver.resolve(new LoopUdf()).orElseThrow();
+        EligibilityResult result = UdfEligibilityAnalyzer.analyse(resolved, List.of(DataTypes.DoubleType, DataTypes.DoubleType), DataTypes.DoubleType, true, true);
+        assertTrue(result.reason().contains("boxed parameter"), result.reason());
+        assertFalse(result.reason().contains("not implemented"), result.reason());
+    }
+
+    /**
+     * And the shape that would be safe -- a body that answers null for a null argument -- is refused
+     * before null handling is even reached, because testing a boxed argument against null is a
+     * reference comparison. Compiling it is TC's --null-aware mode, which needs a transform binding
+     * that takes cuda::std::optional; this is the check that we have not quietly started guessing.
+     */
+    @Test
+    void aUdfThatTestsItsArgumentForNullIsRefused() {
+        ResolvedUdf resolved = UdfResolver.resolve(new NullGuardedUdf()).orElseThrow();
+        EligibilityResult result = UdfEligibilityAnalyzer.analyse(resolved, List.of(DataTypes.LongType), DataTypes.IntegerType, false, true);
+        assertFalse(result.isEligible());
+        assertTrue(result.reason().contains("compares references"), result.reason());
+    }
+
+    /** {@code if (v == null) return null;} -- the one shape for which null-in, null-out is provable. */
+    public static final class NullGuardedUdf implements org.apache.spark.sql.api.java.UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            if (v == null) {
+                return null;
+            }
+            return (int) (v & 0xFF);
+        }
+    }
+
     @Test
     void aNonDeterministicUdfIsRefused() {
         ResolvedUdf resolved = UdfResolver.resolve(new LoopUdf()).orElseThrow();
