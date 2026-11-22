@@ -17,6 +17,7 @@ package ai.beestream.jitudf;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -175,6 +176,79 @@ class CudfDeviceFunctionTest {
         assertNull(CudaSourceCheck.check(result.source(), TcCudaCompiler.ENTRY_SYMBOL, 1));
     }
 
+    /**
+     * Integer division and remainder compile. They were refused outright, on the grounds that TC
+     * lowers Java's division semantics through {@code java_idiv}/{@code java_lrem} helpers and cudf
+     * binds the first function in the source. Two things were wrong with that. TC emits those
+     * helpers as lambdas inside the entry now, so a helper is no longer a second function; and the
+     * case never arose anyway, because {@link UdfEligibilityAnalyzer} only admits a constant
+     * divisor, for which TC emits a plain {@code /} and no helper at all. The refusal was costing
+     * every dividing UDF for a problem none of them had.
+     */
+    @Test
+    void integerDivisionByAConstantCompilesAsOneFunction() {
+        TcCudaCompiler.Result result = compile(new RatioUdf(), List.of(DataTypes.LongType), DataTypes.IntegerType).result();
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains(" / 7") || cuda.contains("/ 7LL"), () -> "a constant divisor is a plain divide:\n" + cuda),
+                () -> assertTrue(cuda.contains(" % 13") || cuda.contains("% 13"), () -> "and so is the remainder:\n" + cuda),
+                // No helper, so nothing can precede the entry -- checked by cudf's own rule.
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 1), () -> "cudf would bind the wrong function:\n" + cuda));
+    }
+
+    /** Divides and takes a remainder by constants, which is what the analyser admits. */
+    public static final class RatioUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            return (int) ((v / 7L) % 13L);
+        }
+    }
+
+    /**
+     * A divisor the analysis cannot prove non-zero is no longer refused outright: the compilation
+     * carries error reporting, and the entry returns a cudf error code. This needs no change to the
+     * transform binding, because cudf's JIT kernel casts a non-void result to {@code cudf::errc}
+     * (release/26.08, cpp/src/transform/jit/kernel.cu) and raises for the call.
+     */
+    @Test
+    void aVariableDivisorCompilesWithErrorReporting() {
+        ResolvedUdf resolved = ConstantFieldFolding.fold(UdfResolver.resolve(new VariableDivisorUdf()).orElseThrow());
+        EligibilityResult without = UdfEligibilityAnalyzer.analyse(resolved, List.of(DataTypes.LongType), DataTypes.IntegerType, false, true, false);
+        assertFalse(without.isEligible(), "without an error channel this must still be refused");
+        assertTrue(without.reason().contains("cannot prove non-zero"), without::reason);
+
+        EligibilityResult with = UdfEligibilityAnalyzer.analyse(resolved, List.of(DataTypes.LongType), DataTypes.IntegerType, false, true, true);
+        assertTrue(with.isEligible(), with::reason);
+        assertTrue(with.reportsArithmeticErrors(), "the compilation has to report errors");
+
+        String identity = KernelIdentity.of(resolved, with.inputs(), with.outputKind());
+        CudfDeviceFunctionGenerator.Generated generated = CudfDeviceFunctionGenerator.generate(resolved, with.inputs(), with.outputKind(), identity);
+        TcCudaCompiler.Result result = TcCudaCompiler.compile(generated, with.inputs(), new VariableDivisorUdf().getClass().getClassLoader(), true);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                // int, not void: that is the whole mechanism.
+                () -> assertTrue(cuda.contains("__device__ int GENERIC_TRANSFORM_OP("), () -> "signature was:\n" + cuda),
+                // 2 is cudf::errc::DIVISION_BY_ZERO.
+                () -> assertTrue(cuda.contains("return 2;"), () -> "no division-by-zero code emitted:\n" + cuda),
+                () -> assertTrue(cuda.contains("return 0;"), () -> "no success code emitted:\n" + cuda),
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 1), () -> "cudf would bind the wrong function:\n" + cuda));
+    }
+
+    /** Divides by a value derived from the input, which no constant analysis can prove non-zero. */
+    public static final class VariableDivisorUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            long d = v >>> 32;
+            return (int) (v / d);
+        }
+    }
+
     @Test
     void jdkBitIntrinsicsCompileByInliningTheJdksOwnBytecode() {
         // Long.bitCount is in no TornadoVM intrinsic table. It compiles because TC follows the call
@@ -278,7 +352,7 @@ class CudfDeviceFunctionTest {
         }
     }
 
-    /** Division by a provably non-zero constant: the analyser allows it, the cudf backend cannot ship it. */
+    /** Division by a provably non-zero constant: what the analyser allows, and what now compiles. */
     public static final class ConstantDivisorUdf implements UDF1<Long, Integer> {
         @Override
         public Integer call(Long x) {
@@ -290,33 +364,41 @@ class CudfDeviceFunctionTest {
         }
     }
 
+    /**
+     * Which backend is in use decides this one, and that is the point: cudf can be told that a row
+     * failed, and the TornadoVM runtime path cannot. So the same UDF compiles for one and is refused
+     * by the other, rather than both guessing.
+     */
     @Test
-    void divisionByAVariableIsRefusedByTheAnalyser() {
+    void aVariableDivisorIsAdmittedOnlyByTheBackendThatCanReportTheError() {
         String previous = System.getProperty("tornado.spark.backend");
-        System.setProperty("tornado.spark.backend", TornadoUdfProvider.BACKEND_CUDF_TRANSFORM);
         try {
-            Object udf = TornadoUdfProvider.tryCompile(new DividingUdf(), new org.apache.spark.sql.types.DataType[] { DataTypes.LongType },
+            System.setProperty("tornado.spark.backend", TornadoUdfProvider.BACKEND_CUDF_TRANSFORM);
+            Object onCudf = TornadoUdfProvider.tryCompile(new DividingUdf(), new org.apache.spark.sql.types.DataType[] { DataTypes.LongType },
                     DataTypes.IntegerType, false, true, "dividing", new String[] { "LOOP" }, "a loop");
-            assertNull(udf);
-            String decision = TornadoUdfProvider.decisions().get("dividing");
-            // Java raises ArithmeticException on a zero divisor and a kernel cannot, so this is
-            // refused before the backend is even consulted.
+            assertNotNull(onCudf, () -> "reason was: " + TornadoUdfProvider.decisions().get("dividing"));
+
+            System.clearProperty("tornado.spark.backend");
+            Object onRuntime = TornadoUdfProvider.tryCompile(new DividingUdf(), new org.apache.spark.sql.types.DataType[] { DataTypes.LongType },
+                    DataTypes.IntegerType, false, true, "dividing-runtime", new String[] { "LOOP" }, "a loop");
+            assertNull(onRuntime, "the runtime backend has no way to report a zero divisor");
+            String decision = TornadoUdfProvider.decisions().get("dividing-runtime");
             assertTrue(decision != null && decision.contains("cannot prove non-zero"), () -> "reason was: " + decision);
         } finally {
             restore(previous);
         }
     }
 
+    /** The provider end of the same change: this UDF used to be refused and now becomes a kernel. */
     @Test
-    void integerDivisionIsRefusedWithAReasonAboutTheUdf() {
+    void aDividingUdfReachesTheGpuPath() {
         String previous = System.getProperty("tornado.spark.backend");
         System.setProperty("tornado.spark.backend", TornadoUdfProvider.BACKEND_CUDF_TRANSFORM);
         try {
             Object udf = TornadoUdfProvider.tryCompile(new ConstantDivisorUdf(), new org.apache.spark.sql.types.DataType[] { DataTypes.LongType },
                     DataTypes.IntegerType, false, true, "constantDivisor", new String[] { "LOOP" }, "a loop");
-            assertNull(udf, "a helper function cannot be shipped through cudf's single-function binding");
-            String decision = TornadoUdfProvider.decisions().get("constantDivisor");
-            assertTrue(decision != null && decision.contains("helper function"), () -> "reason was: " + decision);
+            assertNotNull(udf, () -> "reason was: " + TornadoUdfProvider.decisions().get("constantDivisor"));
+            assertTrue(udf instanceof CudfTransformUdf, () -> "expected a cudf transform UDF, got " + udf.getClass());
         } finally {
             restore(previous);
         }

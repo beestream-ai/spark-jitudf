@@ -143,6 +143,18 @@ public final class UdfEligibilityAnalyzer {
      *         running it per row on a GPU would change when and how often it is evaluated.
      */
     public static EligibilityResult analyse(ResolvedUdf udf, List<DataType> inputTypes, DataType outputType, boolean inputsNullable, boolean deterministic) {
+        return analyse(udf, inputTypes, outputType, inputsNullable, deterministic, false);
+    }
+
+    /**
+     * As above, for a backend that can report an arithmetic error back to Spark rather than having
+     * to prove one cannot happen. cudf's transform can: its JIT kernel casts a non-void result from
+     * the device function to {@code cudf::errc} and raises {@code cudf::evaluation_error} for the
+     * call, which is a failed query, as Java's {@code ArithmeticException} would be. The TornadoVM
+     * runtime backend has no such channel, so it passes false and keeps refusing.
+     */
+    public static EligibilityResult analyse(ResolvedUdf udf, List<DataType> inputTypes, DataType outputType, boolean inputsNullable, boolean deterministic,
+            boolean canReportArithmeticErrors) {
         if (udf == null) {
             return EligibilityResult.ineligible("the user's UDF could not be found behind Spark's wrapper");
         }
@@ -219,15 +231,16 @@ public final class UdfEligibilityAnalyzer {
             return EligibilityResult.ineligible("the method returns " + udf.method().getReturnType().getSimpleName() + " but the UDF is declared " + outputType.simpleString());
         }
 
-        String problem = walkReachableMethods(udf, inputs);
+        boolean[] needsErrorReporting = { false };
+        String problem = walkReachableMethods(udf, inputs, canReportArithmeticErrors, needsErrorReporting);
         if (problem != null) {
             return EligibilityResult.ineligible(problem);
         }
-        return EligibilityResult.eligible(udf, inputs, outputKind);
+        return needsErrorReporting[0] ? EligibilityResult.eligibleWithArithmeticErrors(udf, inputs, outputKind) : EligibilityResult.eligible(udf, inputs, outputKind);
     }
 
     /** Walks every method the UDF can reach inside its own class; returns the first problem or null. */
-    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs) {
+    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
         ClassNode classNode = new ClassNode();
         new ClassReader(udf.classFile()).accept(classNode, ClassReader.SKIP_FRAMES);
         String owner = classNode.name;
@@ -264,7 +277,7 @@ public final class UdfEligibilityAnalyzer {
             }
             Set<Integer> referenceSlots = isEntry ? parameterSlots(method, inputs) : Set.of();
             String problem = checkInstructions(method, classNode, pending, seen, key, callGraph, referenceSlots,
-                    isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none());
+                    isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none(), canReportArithmeticErrors, needsErrorReporting);
             if (problem != null) {
                 return problem;
             }
@@ -398,7 +411,7 @@ public final class UdfEligibilityAnalyzer {
             Opcodes.IRETURN, Opcodes.LRETURN, Opcodes.FRETURN, Opcodes.DRETURN);
 
     private static String checkInstructions(MethodNode method, ClassNode classNode, Deque<String> pending, Set<String> seen, String self,
-            Map<String, Set<String>> callGraph, Set<Integer> referenceSlots, ArrayParameters arrays) {
+            Map<String, Set<String>> callGraph, Set<Integer> referenceSlots, ArrayParameters arrays, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
         String arrayProblem = arrays.check(method);
         if (arrayProblem != null) {
             return arrayProblem;
@@ -412,7 +425,7 @@ public final class UdfEligibilityAnalyzer {
                 continue; // labels, line numbers, frames
             }
             if (ALLOWED_OPCODES.contains(op)) {
-                String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op);
+                String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op, canReportArithmeticErrors, needsErrorReporting);
                 if (divisionProblem != null) {
                     return divisionProblem;
                 }
@@ -422,7 +435,7 @@ public final class UdfEligibilityAnalyzer {
                 // Integer division and remainder are allowed only where the divisor is provably
                 // non-zero, because the device has no way to raise Java's ArithmeticException.
                 case Opcodes.IDIV, Opcodes.IREM, Opcodes.LDIV, Opcodes.LREM -> {
-                    String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op);
+                    String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op, canReportArithmeticErrors, needsErrorReporting);
                     if (divisionProblem != null) {
                         return divisionProblem;
                     }
@@ -495,12 +508,19 @@ public final class UdfEligibilityAnalyzer {
      * query would silently get a number where Java raises {@code ArithmeticException}. They are
      * admitted only when the divisor is a non-zero constant sitting directly in front of them.
      */
-    private static String checkDivision(AbstractInsnNode insn, AbstractInsnNode previous, int op) {
+    private static String checkDivision(AbstractInsnNode insn, AbstractInsnNode previous, int op, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
         if (op != Opcodes.IDIV && op != Opcodes.IREM && op != Opcodes.LDIV && op != Opcodes.LREM) {
             return null;
         }
         Long divisor = constantOf(previous);
         if (divisor == null) {
+            if (canReportArithmeticErrors) {
+                // The divisor may be zero on some row, and the backend can say so: compile with
+                // error reporting on and let cudf raise for the call, which fails the query the way
+                // Java's ArithmeticException would.
+                needsErrorReporting[0] = true;
+                return null;
+            }
             return "the UDF divides by a value this analysis cannot prove non-zero; Java would raise ArithmeticException and a kernel cannot";
         }
         if (divisor == 0) {

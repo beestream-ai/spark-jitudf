@@ -101,8 +101,11 @@ public final class TornadoUdfProvider {
             ResolvedUdf resolved = ConstantFieldFolding.fold(found);
 
             ResolvedUdf resolvedUdf = resolved;
+            // The cudf backend can report an arithmetic error back to Spark (see TcCudaCompiler); the
+            // runtime backend cannot, so only one of them may admit a divisor it cannot prove non-zero.
+            boolean canReportArithmeticErrors = BACKEND_CUDF_TRANSFORM.equals(backend());
             EligibilityResult eligibility = CompilePhases.time(CompilePhases.Phase.ANALYSE,
-                    () -> UdfEligibilityAnalyzer.analyse(resolvedUdf, List.of(inputTypes), outputType, inputsNullable, deterministic));
+                    () -> UdfEligibilityAnalyzer.analyse(resolvedUdf, List.of(inputTypes), outputType, inputsNullable, deterministic, canReportArithmeticErrors));
             if (!eligibility.isEligible()) {
                 return refuse(name, eligibility.reason());
             }
@@ -113,7 +116,11 @@ public final class TornadoUdfProvider {
             // make the new backend depend on the old one's artifacts, and on a TornadoVM jar being
             // present to load them, which is the dependency it exists to remove.
             if (BACKEND_CUDF_TRANSFORM.equals(backend())) {
-                return cudfTransformUdf(name, resolvedUdf, eligibility, KernelIdentity.of(resolvedUdf, eligibility.inputs(), eligibility.outputKind()));
+                // The key distinguishes the two compilations of the same UDF: with error reporting
+                // the entry returns a cudf error code instead of nothing, which is different source.
+                String key = KernelIdentity.of(resolvedUdf, eligibility.inputs(), eligibility.outputKind())
+                        + (eligibility.reportsArithmeticErrors() ? "+errc" : "");
+                return cudfTransformUdf(name, resolvedUdf, eligibility, key);
             }
 
             ParallelKernelGenerator.Generated generated = CompilePhases.time(CompilePhases.Phase.GENERATE,
@@ -234,13 +241,8 @@ public final class TornadoUdfProvider {
             return refuse(name, "the cudf entry point could not be generated: " + e);
         }
 
-        String arithmetic = unsupportedArithmetic(generated.classFile());
-        if (arithmetic != null) {
-            return refuse(name, arithmetic);
-        }
-
         TcCudaCompiler.Result compiled = CompilePhases.time(CompilePhases.Phase.VERIFY,
-                () -> TcCudaCompiler.compile(generated, eligibility.inputs(), resolved.declaringClass().getClassLoader()));
+                () -> TcCudaCompiler.compile(generated, eligibility.inputs(), resolved.declaringClass().getClassLoader(), eligibility.reportsArithmeticErrors()));
         if (!compiled.ok()) {
             return refuse(name, compiled.refusal());
         }
@@ -252,42 +254,6 @@ public final class TornadoUdfProvider {
         DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform): " + eligibility.inputs() + " -> " + eligibility.outputKind());
         ACCEPTED.incrementAndGet();
         return new CudfTransformUdf(compiled.source(), name, eligibility.outputKind(), eligibility.inputs().size());
-    }
-
-    /**
-     * Why this UDF's arithmetic cannot go through {@code cudf::transform}, or null.
-     *
-     * <p>
-     * This is narrower than it looks, because {@link UdfEligibilityAnalyzer} has already refused
-     * every division whose divisor it could not prove non-zero -- Java raises
-     * {@code ArithmeticException} there and a kernel cannot. What reaches this point is division
-     * that is safe to perform and still cannot be shipped: TC lowers Java's division semantics
-     * through {@code java_idiv} and {@code java_lrem} helper functions, and cudf binds the
-     * <em>first</em> function in the source string, so a helper ahead of the entry would be bound
-     * instead of the UDF.
-     * </p>
-     *
-     * <p>
-     * {@link CudaSourceCheck} catches the same thing afterwards, by counting functions in the
-     * generated CUDA. Catching it here as well is not redundant: it gives the reason in terms of the
-     * user's UDF rather than in terms of CUDA they never wrote.
-     * </p>
-     */
-    private static String unsupportedArithmetic(byte[] generatedClass) {
-        org.objectweb.asm.tree.ClassNode node = new org.objectweb.asm.tree.ClassNode();
-        new org.objectweb.asm.ClassReader(generatedClass).accept(node, org.objectweb.asm.ClassReader.SKIP_FRAMES);
-        for (org.objectweb.asm.tree.MethodNode method : node.methods) {
-            for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions) {
-                switch (insn.getOpcode()) {
-                    case org.objectweb.asm.Opcodes.IDIV, org.objectweb.asm.Opcodes.LDIV ->
-                        { return "the UDF divides integers, which this compiler lowers through a helper function; cudf::transform binds the first function in the source, so a helper cannot be shipped alongside the UDF"; }
-                    case org.objectweb.asm.Opcodes.IREM, org.objectweb.asm.Opcodes.LREM ->
-                        { return "the UDF takes an integer remainder, which this compiler lowers through a helper function; cudf::transform binds the first function in the source, so a helper cannot be shipped alongside the UDF"; }
-                    default -> { }
-                }
-            }
-        }
-        return null;
     }
 
     /**

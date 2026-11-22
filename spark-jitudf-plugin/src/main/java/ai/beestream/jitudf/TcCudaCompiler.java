@@ -86,6 +86,36 @@ public final class TcCudaCompiler {
      *         the loader that defined the user's UDF, for its helpers' bytes.
      */
     public static Result compile(CudfDeviceFunctionGenerator.Generated generated, List<InputSpec> inputs, ClassLoader userLoader) {
+        return compile(generated, inputs, userLoader, false);
+    }
+
+    /**
+     * As above; {@code reportArithmeticErrors} compiles with {@code TcOptions.withDeviceFunctionErrors},
+     * which makes the device function return a {@code cudf::errc} rather than nothing -- 1 for an
+     * overflow in {@code Math.*Exact}, 2 for an integer division by zero.
+     *
+     * <p>
+     * This needs no change to the transform binding. cudf's JIT kernel decides at compile time what
+     * to do with the result, in {@code cpp/src/transform/jit/kernel.cu} of release/26.08:
+     * </p>
+     *
+     * <pre>
+     * if constexpr (!cuda::std::is_void_v&lt;decltype(GENERIC_TRANSFORM_OP(a...))&gt;) {
+     *   return static_cast&lt;cudf::errc&gt;(GENERIC_TRANSFORM_OP(a...));
+     * } else {
+     *   (void)GENERIC_TRANSFORM_OP(a...);
+     *   return errc::SUCCESS;
+     * }
+     * </pre>
+     *
+     * <p>
+     * The per-row codes are reduced with {@code max} into a per-thread value and then atomically into
+     * one per launch, which the host turns into {@code cudf::evaluation_error} for the call. So a UDF
+     * that divides by zero on any row fails the query, as Java's {@code ArithmeticException} would,
+     * instead of writing a wrong number.
+     * </p>
+     */
+    public static Result compile(CudfDeviceFunctionGenerator.Generated generated, List<InputSpec> inputs, ClassLoader userLoader, boolean reportArithmeticErrors) {
         CompositeBytecodeSource source = new CompositeBytecodeSource(userLoader).with(generated.internalName(), generated.classFile());
 
         // One fact per parameter of the compiled method, which is one per UDF input: nothing is assumed
@@ -99,7 +129,7 @@ public final class TcCudaCompiler {
         TcCompiler.Compilation compilation;
         try {
             compilation = TcCompiler.compileDeviceFunction(source, generated.className(), generated.bodyMethod(), generated.bodyDescriptor(),
-                    target(), TcOptions.DEFAULTS, facts);
+                    target(), TcOptions.DEFAULTS.withDeviceFunctionErrors(reportArithmeticErrors), facts);
         } catch (RuntimeException | LinkageError e) {
             // TC reports failures as diagnostics rather than exceptions, so anything thrown here is
             // unexpected. It is still a reason to leave the query alone, not to fail it.

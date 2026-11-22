@@ -94,12 +94,13 @@ else
   DRIVER_OPTS="$TORNADO_OPTS"
 fi
 
-# Which class RAPIDS calls as the UDF provider. The fallback hook in the cudf-spark fork still
-# defaults to the pre-Beestream class name, and that default is baked into the patched RAPIDS jar,
-# so without this the bridge finds nothing and every UDF quietly stays on the CPU -- the run still
-# produces correct results, which is exactly what makes it easy to miss. Naming the provider here
-# keeps this repository working against the published fork, rather than needing a change to it.
-DRIVER_OPTS="$DRIVER_OPTS -Dspark.rapids.sql.tornadovm.provider=${JITUDF_PROVIDER:-ai.beestream.jitudf.TornadoUdfProvider}"
+# Which class RAPIDS calls as the UDF provider. The fork's own default is already this class, so
+# this is belt and braces rather than a workaround -- but it is worth having, because the failure
+# it guards against is silent: a patched RAPIDS jar built before the move to ai.beestream names the
+# old class, the bridge then finds no provider, and every UDF quietly stays on the CPU. The run
+# still produces correct results, which is what makes that easy to miss. Set JITUDF_PROVIDER to
+# override, or to empty to leave the fork's default alone.
+DRIVER_OPTS="$DRIVER_OPTS -Dspark.rapids.sql.tornadovm.provider=${JITUDF_PROVIDER-ai.beestream.jitudf.TornadoUdfProvider}"
 
 set +e
 # PROFILE_WRAP lets a profiler (nsys, ncu) wrap the whole submit without a second copy of this

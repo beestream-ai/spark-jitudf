@@ -25,8 +25,14 @@ public final class EligibilityResult {
     private final List<InputSpec> inputs;
     private final PrimitiveKind outputKind;
     private final ResolvedUdf udf;
+    private final boolean reportsArithmeticErrors;
 
     private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf) {
+        this(eligible, reason, inputs, outputKind, udf, false);
+    }
+
+    private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf, boolean reportsArithmeticErrors) {
+        this.reportsArithmeticErrors = reportsArithmeticErrors;
         this.eligible = eligible;
         this.reason = reason;
         this.inputs = inputs;
@@ -36,6 +42,21 @@ public final class EligibilityResult {
 
     public static EligibilityResult eligible(ResolvedUdf udf, List<InputSpec> inputs, PrimitiveKind outputKind) {
         return new EligibilityResult(true, "", inputs, outputKind, udf);
+    }
+
+    /**
+     * Eligible, but only because the backend can report an arithmetic error back to Spark: the UDF
+     * divides by something this analysis cannot prove non-zero, so the compilation has to carry
+     * {@code TcOptions.withDeviceFunctionErrors} and the device function returns a cudf error code
+     * instead of nothing.
+     */
+    public static EligibilityResult eligibleWithArithmeticErrors(ResolvedUdf udf, List<InputSpec> inputs, PrimitiveKind outputKind) {
+        return new EligibilityResult(true, "", inputs, outputKind, udf, true);
+    }
+
+    /** Whether the compilation must report arithmetic errors, rather than assuming they cannot happen. */
+    public boolean reportsArithmeticErrors() {
+        return reportsArithmeticErrors;
     }
 
     public static EligibilityResult ineligible(String reason) {

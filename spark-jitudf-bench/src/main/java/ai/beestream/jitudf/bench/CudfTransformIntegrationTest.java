@@ -120,6 +120,49 @@ public final class CudfTransformIntegrationTest {
         }
     }
 
+    /** Integer division and remainder by constants: refused outright until the obsolete gate went. */
+    public static final class DigitSumUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            long x = v;
+            int sum = 0;
+            while (x > 0) {
+                sum += (int) (x % 10);
+                x = x / 10;
+            }
+            return sum;
+        }
+    }
+
+    /**
+     * Divides by a value taken from the input, which no constant analysis can prove non-zero. It
+     * compiles because cudf can be told the row failed: the device function returns a cudf error
+     * code. Here the divisor is never zero, so the codes are all SUCCESS and the answer must equal
+     * the CPU's.
+     */
+    public static final class VariableDivisorUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            long d = (v & 0xFFL) + 1;
+            return (int) (v / d);
+        }
+    }
+
+    /** Divides by a value that really is zero on some rows: the query must fail, not answer. */
+    public static final class ZeroDivisorUdf implements UDF1<Long, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long v) {
+            long d = v % 1000;
+            return (int) (v / d);
+        }
+    }
+
     public static void main(String[] args) {
         int rows = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
 
@@ -133,11 +176,18 @@ public final class CudfTransformIntegrationTest {
             spark.udf().register("cudf_active_days", new ActiveDaysUdf(), DataTypes.IntegerType);
             spark.udf().register("cudf_bounded", new BoundedCollatzUdf(24), DataTypes.IntegerType);
             spark.udf().register("cudf_bitmap_list", new ActivityBitmapUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_digit_sum", new DigitSumUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_var_div", new VariableDivisorUdf(), DataTypes.IntegerType);
+            spark.udf().register("cudf_zero_div", new ZeroDivisorUdf(), DataTypes.IntegerType);
 
             runCase(spark, "C1-collatz-loop", "cudf_collatz", rows);
             runCase(spark, "C2-activity-bitmap", "cudf_active_days", rows);
             runCase(spark, "C3-constructor-configured", "cudf_bounded", rows);
             runListCase(spark, rows);
+            // Integer division and remainder, by a constant and by a value from the row.
+            runCase(spark, "C5-integer-division", "cudf_digit_sum", rows);
+            runCase(spark, "C6-variable-divisor", "cudf_var_div", rows);
+            runZeroDivisorCase(spark, rows);
             checkProviderProducedCuda();
             printDecisions();
         } finally {
@@ -221,6 +271,39 @@ public final class CudfTransformIntegrationTest {
         check("C4-activity-bitmap-list: every row identical to CPU Spark", mismatches == 0 && cpu.size() == gpu.size(), mismatches + " rows differ");
         String plan = plan(spark, rows, "cudf_bitmap_list", true);
         check("C4-activity-bitmap-list: no CPU fallback", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+    }
+
+    /**
+     * The other half of admitting a divisor that cannot be proved non-zero: when it really is zero,
+     * the query has to fail. On the CPU Java raises ArithmeticException; on the GPU the device
+     * function returns cudf::errc::DIVISION_BY_ZERO, the kernel reduces it into one code for the
+     * launch, and cudf raises evaluation_error for the call. Different exceptions, but the same
+     * outcome, and the outcome is the thing that must not change: a wrong number instead of a
+     * failure would be the worst result this integration could produce.
+     */
+    private static void runZeroDivisorCase(SparkSession spark, int rows) {
+        System.out.println();
+        System.out.println("--- C7-divide-by-zero ---");
+        boolean cpuFailed = failsWith(spark, rows, "cudf_zero_div", false);
+        boolean gpuFailed = failsWith(spark, rows, "cudf_zero_div", true);
+        check("C7-divide-by-zero: CPU Spark fails the query", cpuFailed, "the CPU did not fail, so there is nothing to match");
+        check("C7-divide-by-zero: the GPU path fails it too, rather than answering", gpuFailed, "the GPU produced a result where the CPU raised");
+    }
+
+    /** Whether the query throws, which is what both paths are supposed to do here. */
+    private static boolean failsWith(SparkSession spark, int rows, String udf, boolean enabled) {
+        try {
+            collect(spark, rows, udf, enabled);
+            return false;
+        } catch (Exception e) {
+            Throwable root = e;
+            while (root.getCause() != null && root.getCause() != root) {
+                root = root.getCause();
+            }
+            System.out.println("  " + (enabled ? "gpu" : "cpu") + " raised " + root.getClass().getName() + ": "
+                    + String.valueOf(root.getMessage()).lines().findFirst().orElse(""));
+            return true;
+        }
     }
 
     private static List<Row> collect(SparkSession spark, int rows, String udf, boolean enabled) {
