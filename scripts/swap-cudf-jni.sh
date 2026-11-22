@@ -30,11 +30,39 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
 CUDF_JNI_VERSION=${CUDF_JNI_VERSION:-26.08.0-tcudf}
-JNI_JAR=${1:-${CUDF_JNI_JAR:-$HOME/.m2/repository/com/nvidia/spark-rapids-jni/$CUDF_JNI_VERSION/spark-rapids-jni-$CUDF_JNI_VERSION-cuda12.jar}}
+
+# The classifier is not always cuda12. The build appends the host architecture on aarch64, so the
+# same version is spark-rapids-jni-<v>-cuda12.jar on x86-64 and spark-rapids-jni-<v>-cuda12-arm64.jar
+# on ARM, and a CUDA 13 build says cuda13. Resolving it beats assuming it: hard-coding cuda12 here
+# would have made this script silently wrong on the second machine it ever ran on.
+resolve_jni_jar() {
+  local dir=$HOME/.m2/repository/com/nvidia/spark-rapids-jni/$CUDF_JNI_VERSION
+  [ -d "$dir" ] || return 1
+  local found=()
+  local f
+  for f in "$dir"/spark-rapids-jni-"$CUDF_JNI_VERSION"-*.jar; do
+    # -tests.jar and -sources.jar are not the artifact.
+    case "$f" in *-tests.jar|*-sources.jar|*'*'*) continue ;; esac
+    found+=("$f")
+  done
+  case ${#found[@]} in
+    0) return 1 ;;
+    1) printf '%s\n' "${found[0]}" ;;
+    *) echo "several candidate JNI jars in $dir; set CUDF_JNI_JAR to the one you mean:" >&2
+       printf '  %s\n' "${found[@]}" >&2
+       return 1 ;;
+  esac
+}
+
+JNI_JAR=${1:-${CUDF_JNI_JAR:-$(resolve_jni_jar || true)}}
 IN_JAR=${2:-$RAPIDS_JAR}
 OUT_JAR=${3:-${IN_JAR%.jar}-jni.jar}
 
-[ -f "$JNI_JAR" ] || { echo "no JNI jar at $JNI_JAR" >&2; echo "build one with cudf-spark's upstream-patches/build-cudf-spark-jni.sh" >&2; exit 2; }
+[ -n "$JNI_JAR" ] && [ -f "$JNI_JAR" ] || {
+  echo "no JNI jar found for version $CUDF_JNI_VERSION" >&2
+  echo "build one with cudf-spark's upstream-patches/build-cudf-spark-jni.sh, or set CUDF_JNI_JAR" >&2
+  exit 2
+}
 [ -f "$IN_JAR" ] || { echo "no RAPIDS jar at $IN_JAR" >&2; exit 2; }
 
 echo "jni : $JNI_JAR"

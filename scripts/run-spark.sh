@@ -78,9 +78,15 @@ TRANSIENT="${WITNESS%.log}-transient.log"
     done
     sleep 2
   done
-) &
+# 9>&- closes the lock file descriptor in the witness, and it matters more than it looks. The
+# exclusivity lock is held by fd 9 in this shell, and a background subshell inherits every open
+# descriptor -- so the witness would keep the lock alive after this script exited, and the next
+# run in a sequential campaign would be refused with "another Spark run holds the lock" by a
+# process that is only watching. The symptom looks exactly like a real double-run, which is the
+# one thing this lock exists to make unambiguous.
+) 9>&- &
 WITNESS_PID=$!
-trap 'kill $WITNESS_PID 2>/dev/null || true' EXIT
+trap 'kill $WITNESS_PID 2>/dev/null || true; wait $WITNESS_PID 2>/dev/null || true' EXIT
 
 # set -e off around the run itself: a failing job's exit code is a result to report, not a reason
 # to abandon the script before it can say whether the GPU was shared. The reported code is the
