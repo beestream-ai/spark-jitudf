@@ -84,11 +84,37 @@ git clone --branch feature/tornadovm-udf-fallback \
   https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
 
 ./scripts/build-rapids-patch.sh     # the fork's changes into the released RAPIDS jar
-mvn package                         # both modules, and the plugin's 33 unit tests
+mvn package                         # both modules, and the plugin's 81 unit tests
 ./scripts/run-spark.sh ai.beestream.jitudf.bench.IntegrationTest
 ```
 
-The last command must end `CHECKS: 27, FAILURES: 0`.
+The last command must end `CHECKS: 30, FAILURES: 0`.
+
+### The cuDF `transform` backend
+
+The steps above give you the **runtime backend**, which binds cuDF's buffers and runs a TornadoVM
+kernel over them, and so needs a `TORNADO_SDK` on every JVM that executes a task. The **cuDF
+backend** is the one to look at: it compiles the UDF to a CUDA `__device__` function on the driver
+and hands cuDF a string, so an executor needs nothing of TornadoVM at all.
+
+It needs one more thing — a cuDF JNI with a multi-input, typed-output, null-aware `transform`
+binding. The released one is hard-wired to a single input column and an INT32 result. The binding
+is carried as a patch, with a build script that applies it to NVIDIA's pinned sources:
+
+```bash
+# in the cudf-spark fork cloned above
+third_party/cudf-spark/upstream-patches/build-cudf-spark-jni.sh
+
+# then fold the result into the RAPIDS jar, rather than putting it first on the class path:
+# two jars carrying ai/rapids/cudf plus libcudf.so is an UnsatisfiedLinkError waiting to happen
+./scripts/swap-cudf-jni.sh
+
+RAPIDS_JAR=third_party/rapids-4-spark_2.13-26.08.1-tornado-jni.jar   ./scripts/run-spark.sh ai.beestream.jitudf.bench.CudfTransformIntegrationTest 200000
+```
+
+That must end `CHECKS: 78, FAILURES: 0`. It is a long build — around 40 minutes, because it
+compiles libcudf — and it detects your GPU and builds for it. `CUDA_VERSION=13.0.2` builds a
+`cuda13` artifact instead; both classifiers can coexist.
 
 Every path above can be overridden from the environment; `scripts/env.sh` lists them and derives
 the rest from the repository root, so a clone anywhere works without editing anything.
@@ -106,7 +132,8 @@ Each of these is `./scripts/run-spark.sh <class>`. They need the build above; no
 
 | Class (under `ai.beestream.jitudf.bench`) | What it shows |
 |---|---|
-| `IntegrationTest` | The whole thing: a UDF with a loop reaching a kernel, a string-returning UDF correctly staying on the CPU, an expression RAPIDS already handled keeping its path, and every accelerated value compared row by row against the same UDF on the CPU. Ends `CHECKS: 27, FAILURES: 0`. |
+| `IntegrationTest` | The whole thing: a UDF with a loop reaching a kernel, a string-returning UDF correctly staying on the CPU, a boolean-returning UDF correctly refused by *this* backend and told which one would take it, an expression RAPIDS already handled keeping its path, and every accelerated value compared row by row against the same UDF on the CPU. Ends `CHECKS: 30, FAILURES: 0`. |
+| `CudfTransformIntegrationTest` | The same idea for the cuDF backend, and wider: 1–5 input columns, INT32/INT64/FLOAT32/FLOAT64/BOOL8 results, nullable columns in and out. Ends `CHECKS: 78, FAILURES: 0`. |
 | `RapidsSmokeTest` | That RAPIDS itself initialises and puts a plain query on the GPU. Run this first if the integration test fails — it separates "RAPIDS is not working here" from "the integration is not working here". |
 | `Benchmark` | End-to-end timings of one query under each configuration, on whatever machine you are on. |
 | `ListStress` | The `ArrayType`/cuDF `LIST` path on its own, at a range of sizes. |
