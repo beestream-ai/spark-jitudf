@@ -602,6 +602,8 @@ final class CoverageCorpus {
         cases.add(new Case("S29", "long floorDiv by -1", Intent.SAFE, new ConditionalDivisorTest.ByMinusOneLong(), new DataType[] { L }, L, false, false, null, null));
         cases.add(new Case("S30", "LIST fold dividing by a conditional element divisor", Intent.SAFE, new ConditionalDivisorTest.ListCondDiv(), new DataType[] { listL }, L, false, false,
                 "zero test", guarded));
+        cases.add(new Case("G04", "LIST fold holding the element in a temporary read inside a conditional (pre-existing recognizer limit)", Intent.GAP,
+                new ConditionalDivisorTest.ListCondDivTemporary(), new DataType[] { listL }, L, false, false));
         cases.add(new Case("S31", "LIST fold dividing by conditional non-zero constants", Intent.SAFE, new ConditionalDivisorTest.ListSafeDiv(), new DataType[] { listL }, L, false,
                 false, "precision: no zero test needed", c -> !zeroTest(c)));
     }

@@ -197,6 +197,19 @@ class ConditionalDivisorTest {
         }
     }
 
+    /** The same fold with the element held in a temporary that a conditional reads: a known gap. */
+    public static final class ListCondDivTemporary implements UDF1<long[], Long> {
+        @Override
+        public Long call(long[] arr) {
+            long acc = 0;
+            for (int i = 0; i < arr.length; i++) {
+                long v = arr[i];
+                acc += 1000L / (v > 5 ? v : 3L);
+            }
+            return acc;
+        }
+    }
+
     public static final class ListSafeDiv implements UDF1<long[], Long> {
         @Override
         public Long call(long[] arr) {

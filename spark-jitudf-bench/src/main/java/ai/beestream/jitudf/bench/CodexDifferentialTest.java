@@ -340,8 +340,9 @@ public final class CodexDifferentialTest {
         public Long call(scala.collection.Seq<Long> arr) {
             long acc = 0;
             for (int i = 0; i < arr.length(); i++) {
-                long v = arr.apply(i);
-                acc += 1000L / (v > 5 ? v : 3L);
+                // The element is read where it is used: a temporary read inside a conditional is a
+                // shape the LIST recognizer does not yet accept (coverage corpus G04).
+                acc += 1000L / (arr.apply(i) > 5 ? arr.apply(i) : 3L);
             }
             return acc;
         }
