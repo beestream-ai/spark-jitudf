@@ -36,7 +36,28 @@ public enum PrimitiveKind {
     INT(DataTypes.IntegerType, DType.INT32, int.class, Integer.class, "uk/ac/manchester/tornado/api/types/arrays/IntArray", "I", 4),
     LONG(DataTypes.LongType, DType.INT64, long.class, Long.class, "uk/ac/manchester/tornado/api/types/arrays/LongArray", "J", 8),
     FLOAT(DataTypes.FloatType, DType.FLOAT32, float.class, Float.class, "uk/ac/manchester/tornado/api/types/arrays/FloatArray", "F", 4),
-    DOUBLE(DataTypes.DoubleType, DType.FLOAT64, double.class, Double.class, "uk/ac/manchester/tornado/api/types/arrays/DoubleArray", "D", 8);
+    DOUBLE(DataTypes.DoubleType, DType.FLOAT64, double.class, Double.class, "uk/ac/manchester/tornado/api/types/arrays/DoubleArray", "D", 8),
+
+    /**
+     * {@code boolean} / cuDF {@code BOOL8}.
+     *
+     * <p>
+     * The array name is {@code ByteArray}, because TornadoVM has no {@code BooleanArray} -- and
+     * that mismatch is the reason this kind is admitted on the cuDF backend only. The cuDF path
+     * never instantiates it: {@code TcCompiler} compiles the lowered <em>body</em> method, whose
+     * return type is an ordinary {@code boolean}, and the array appears solely in the unused
+     * {@code cudfEntry} wrapper that is generated alongside. The TornadoVM runtime backend does
+     * instantiate it, which is why {@link TornadoUdfProvider} refuses a boolean result there
+     * rather than writing booleans into a byte array and hoping the widths agree.
+     * </p>
+     *
+     * <p>
+     * One byte per value, matching cuDF's BOOL8 and the JVM's own treatment of a boolean in an
+     * array. The descriptor is {@code Z}, and every opcode a boolean needs -- load, store, return
+     * -- is the {@code int} one, which is why nothing else in the lowering has to change.
+     * </p>
+     */
+    BOOL(DataTypes.BooleanType, DType.BOOL8, boolean.class, Boolean.class, "uk/ac/manchester/tornado/api/types/arrays/ByteArray", "Z", 1);
 
     /**
      * The TornadoVM native arrays are named, not referenced.
@@ -147,6 +168,9 @@ public enum PrimitiveKind {
             case LONG -> org.objectweb.asm.Opcodes.LALOAD;
             case FLOAT -> org.objectweb.asm.Opcodes.FALOAD;
             case DOUBLE -> org.objectweb.asm.Opcodes.DALOAD;
+            // boolean[] is a byte array to the JVM, so BALOAD. Unreachable in practice: a LIST of
+            // booleans is refused before any array access is lowered.
+            case BOOL -> org.objectweb.asm.Opcodes.BALOAD;
         };
     }
 

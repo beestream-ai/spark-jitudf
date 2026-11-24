@@ -26,7 +26,7 @@ import org.objectweb.asm.tree.MethodInsnNode;
  *
  * <p>
  * The Java UDF interfaces are generic, so a UDF's arithmetic arrives wrapped in calls on
- * {@code Integer}, {@code Long}, {@code Float} and {@code Double}. Most of those calls are pure
+ * {@code Integer}, {@code Long}, {@code Float}, {@code Double} and {@code Boolean}. Most of those calls are pure
  * packaging and have to disappear when the body is lowered to primitives. Some of them are not:
  * {@code Integer.shortValue()} narrows, {@code Double.intValue()} truncates toward zero, and
  * {@code Integer.doubleValue()} widens. Deciding by the shape of the method's name -- "ends with
@@ -65,12 +65,17 @@ final class BoxConversions {
         put("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", IDENTITY);
         put("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;", IDENTITY);
         put("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;", IDENTITY);
+        // Boolean is not a Number, so it has exactly these two calls and no converting
+        // accessors: there is no widening or narrowing a boolean can undergo, and nothing
+        // else on Boolean (compare, logicalAnd, parseBoolean, ...) is lowered.
+        put("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;", IDENTITY);
 
         // The accessor that returns the box's own type: pure unboxing.
         put("java/lang/Integer", "intValue", "()I", IDENTITY);
         put("java/lang/Long", "longValue", "()J", IDENTITY);
         put("java/lang/Float", "floatValue", "()F", IDENTITY);
         put("java/lang/Double", "doubleValue", "()D", IDENTITY);
+        put("java/lang/Boolean", "booleanValue", "()Z", IDENTITY);
 
         // The accessors that convert. Each is unboxing followed by exactly this opcode.
         put("java/lang/Integer", "longValue", "()J", Opcodes.I2L);
@@ -93,13 +98,14 @@ final class BoxConversions {
     private BoxConversions() {
     }
 
-    /** Whether {@code owner} is one of the four boxes this integration carries. */
+    /** Whether {@code owner} is one of the boxes this integration carries. */
     static boolean isSupportedBox(String internalNameOrDescriptor) {
         String name = internalNameOrDescriptor.startsWith("L")
                 ? internalNameOrDescriptor.substring(1, internalNameOrDescriptor.length() - 1)
                 : internalNameOrDescriptor;
         return name.equals("java/lang/Integer") || name.equals("java/lang/Long")
-                || name.equals("java/lang/Float") || name.equals("java/lang/Double");
+                || name.equals("java/lang/Float") || name.equals("java/lang/Double")
+                || name.equals("java/lang/Boolean");
     }
 
     /** Whether this call is one the lowering knows how to replace exactly. */

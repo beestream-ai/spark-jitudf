@@ -302,6 +302,7 @@ public final class CudfDeviceFunctionGenerator {
             case LONG -> Opcodes.LLOAD;
             case FLOAT -> Opcodes.FLOAD;
             case DOUBLE -> Opcodes.DLOAD;
+            case BOOL -> Opcodes.ILOAD;
         };
     }
 

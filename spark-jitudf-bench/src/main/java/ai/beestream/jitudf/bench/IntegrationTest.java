@@ -28,6 +28,7 @@ import ai.beestream.jitudf.bench.udfs.DataDependentLoopUdf;
 import ai.beestream.jitudf.bench.udfs.HelperLoopUdf;
 import ai.beestream.jitudf.bench.udfs.LoopUdf;
 import ai.beestream.jitudf.bench.udfs.MathUdf;
+import ai.beestream.jitudf.bench.udfs.BooleanUdf;
 import ai.beestream.jitudf.bench.udfs.StringUdf;
 
 /**
@@ -61,6 +62,7 @@ public final class IntegrationTest {
             runEmptyListCase(spark);
             runMixedCase(spark);
             runStringCase(spark);
+            runBooleanRefusalCase(spark);
             runControlCase(spark);
             printDecisions();
         } finally {
@@ -128,6 +130,7 @@ public final class IntegrationTest {
         spark.udf().register("tornado_math", new MathUdf(), DataTypes.DoubleType);
         spark.udf().register("tornado_string", new StringUdf(), DataTypes.StringType);
         spark.udf().register("tornado_cosine", new CosineSimilarityUdf(), DataTypes.DoubleType);
+        spark.udf().register("tornado_bool", new BooleanUdf(), DataTypes.BooleanType);
         return spark;
     }
 
@@ -361,6 +364,44 @@ public final class IntegrationTest {
         check("negative-string-udf: left on the existing CPU bridge", !plan.contains("gpu_tornado_string"), "plan was:\n" + plan);
         long positives = df.filter("label = 'positive'").count();
         check("negative-string-udf: correct result", positives == rows, positives + " of " + rows);
+    }
+
+    /**
+     * A boolean result, which this backend has to refuse.
+     *
+     * <p>
+     * The cuDF {@code transform} backend carries a boolean fine -- it writes a BOOL8 column and the
+     * device function's output pointer is a C++ {@code bool}. This one cannot: it binds the result
+     * to a TornadoVM native array, and TornadoVM has no {@code BooleanArray}. Writing booleans into
+     * a {@code ByteArray} and hoping the widths line up is the kind of silent approximation this
+     * integration refuses to make, so the provider declines the UDF at planning time and names the
+     * backend that would take it. The UDF must still produce the right answer on whatever path
+     * RAPIDS leaves it on.
+     * </p>
+     */
+    private static void runBooleanRefusalCase(SparkSession spark) {
+        int rows = 20_000;
+        Dataset<Row> df = data(spark, rows).selectExpr("id", "tornado_bool(a) as flag");
+        String plan = df.queryExecution().executedPlan().toString();
+        check("negative-boolean-udf: not diverted to a kernel", !plan.contains("gpu_tornado_bool"), "plan was:\n" + plan);
+        long trues = df.filter("flag").count();
+        long expected = data(spark, rows).filter("a > 100.0").count();
+        check("negative-boolean-udf: correct result", trues == expected, trues + " vs " + expected);
+        String reason = refusalReason("tornado_bool");
+        check("negative-boolean-udf: the refusal names the backend that can carry it",
+                reason != null && reason.contains("cudf-transform"), String.valueOf(reason));
+    }
+
+    /** The provider's recorded decision for one UDF, or null when it has none. */
+    private static String refusalReason(String name) {
+        try {
+            Class<?> provider = Class.forName("ai.beestream.jitudf.TornadoUdfProvider");
+            Object decisions = provider.getMethod("decisions").invoke(null);
+            Object value = ((java.util.Map<?, ?>) decisions).get(name);
+            return value == null ? null : value.toString();
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null;
+        }
     }
 
     /** An expression RAPIDS handles itself: it must take the path it always took. */

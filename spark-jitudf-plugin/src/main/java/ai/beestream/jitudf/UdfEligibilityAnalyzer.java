@@ -373,7 +373,11 @@ public final class UdfEligibilityAnalyzer {
 
     private static boolean isSupportedPrimitive(Type type) {
         return switch (type.getSort()) {
-            case Type.INT, Type.LONG, Type.FLOAT, Type.DOUBLE -> true;
+            // BOOLEAN is here for a static helper that returns or takes one, and for a static
+            // final boolean constant. Whether a boolean may be an input or a result column is a
+            // separate question, settled by PrimitiveKind and by the backend: the TornadoVM
+            // runtime backend refuses a boolean result because it has no BooleanArray to put it in.
+            case Type.INT, Type.LONG, Type.FLOAT, Type.DOUBLE, Type.BOOLEAN -> true;
             default -> false;
         };
     }
@@ -717,8 +721,16 @@ public final class UdfEligibilityAnalyzer {
         return false;
     }
 
+    /**
+     * The boxes this integration carries, which is exactly the set {@link BoxConversions} can lower.
+     *
+     * <p>
+     * This used to be a second copy of that list. The two drifted apart the moment {@code Boolean}
+     * was added to one of them, so it now asks the table itself: a box the lowering cannot replace
+     * must not be accepted here, and that is one fact, not two.
+     * </p>
+     */
     private static boolean isSupportedBox(String internalNameOrDescriptor) {
-        String name = internalNameOrDescriptor.startsWith("L") ? internalNameOrDescriptor.substring(1, internalNameOrDescriptor.length() - 1) : internalNameOrDescriptor;
-        return name.equals("java/lang/Integer") || name.equals("java/lang/Long") || name.equals("java/lang/Float") || name.equals("java/lang/Double");
+        return BoxConversions.isSupportedBox(internalNameOrDescriptor);
     }
 }

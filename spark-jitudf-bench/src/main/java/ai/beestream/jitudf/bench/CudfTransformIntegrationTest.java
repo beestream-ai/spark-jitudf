@@ -23,6 +23,8 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.api.java.UDF3;
+import org.apache.spark.sql.api.java.UDF4;
+import org.apache.spark.sql.api.java.UDF5;
 import org.apache.spark.sql.types.DataTypes;
 
 import ai.beestream.jitudf.TornadoUdfProvider;
@@ -268,6 +270,86 @@ public final class CudfTransformIntegrationTest {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Arities above three, and booleans.
+    //
+    // Nothing in the compiler, the generator or the binding ever counted to three: every one of
+    // them iterates the input list. These cases exist because "nothing counts to three" is a claim
+    // about code that was only ever exercised with one, two and three columns, and the way to
+    // settle it is to run four and five.
+    //
+    // The boolean cases are different in kind: BOOL8 is a type the integration genuinely did not
+    // carry, and admitting it is why PrimitiveKind has a fifth constant.
+    // -------------------------------------------------------------------------------------------
+
+    /** Four inputs, three different widths among them. */
+    public static final class FourInputUdf implements UDF4<Long, Integer, Integer, Double, Double> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Double call(Long a, Integer b, Integer c, Double d) {
+            double acc = d;
+            for (int i = 0; i < 8; i++) {
+                acc = acc * 1.5 + (a % (b + 1)) - c;
+            }
+            return acc;
+        }
+    }
+
+    /** Five inputs. Integer arithmetic only, so the comparison with CPU Spark is exact. */
+    public static final class FiveInputUdf implements UDF5<Integer, Integer, Long, Integer, Integer, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Integer a, Integer b, Long c, Integer d, Integer e) {
+            long acc = c;
+            acc = acc * 31L + a;
+            acc = acc * 31L + b;
+            acc = acc * 31L + d;
+            acc = acc * 31L + e;
+            return acc;
+        }
+    }
+
+    /** A boolean result: the output type the binding could not ask for before. */
+    public static final class IsLuckyUdf implements UDF1<Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Long v) {
+            long x = v;
+            int digits = 0;
+            while (x > 0) {
+                digits += (int) (x % 10L);
+                x /= 10L;
+            }
+            return (digits % 7) == 0;
+        }
+    }
+
+    /** A boolean input as well as a boolean result. */
+    public static final class BothBooleanUdf implements UDF2<Boolean, Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Boolean flag, Long v) {
+            return flag ? (v % 3L) == 0L : (v % 5L) == 0L;
+        }
+    }
+
+    /** A nullable boolean result, which is a BOOL8 column with a validity mask of its own. */
+    public static final class NullableBooleanUdf implements UDF1<Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Long v) {
+            if (v == null) {
+                return null;
+            }
+            return (v % 4L) == 1L;
+        }
+    }
+
     public static void main(String[] args) {
         int rows = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
         configuredRows = rows;
@@ -292,6 +374,11 @@ public final class CudfTransformIntegrationTest {
             spark.udf().register("cudf_defaulting", new DefaultingUdf(), DataTypes.IntegerType);
             spark.udf().register("cudf_nullable_result", new NullableResultUdf(), DataTypes.IntegerType);
             spark.udf().register("cudf_coalescing", new CoalescingUdf(), DataTypes.LongType);
+            spark.udf().register("cudf_four_input", new FourInputUdf(), DataTypes.DoubleType);
+            spark.udf().register("cudf_five_input", new FiveInputUdf(), DataTypes.LongType);
+            spark.udf().register("cudf_is_lucky", new IsLuckyUdf(), DataTypes.BooleanType);
+            spark.udf().register("cudf_both_boolean", new BothBooleanUdf(), DataTypes.BooleanType);
+            spark.udf().register("cudf_nullable_boolean", new NullableBooleanUdf(), DataTypes.BooleanType);
 
             runCase(spark, "C1-collatz-loop", "cudf_collatz", rows);
             runCase(spark, "C2-activity-bitmap", "cudf_active_days", rows);
@@ -312,6 +399,14 @@ public final class CudfTransformIntegrationTest {
             runValueCase(spark, "C12-nullable-in-non-null-out", "cudf_defaulting", "cudf_defaulting(nseed)", true);
             runValueCase(spark, "C13-nullable-in-nullable-out", "cudf_nullable_result", "cudf_nullable_result(nseed)", true);
             runValueCase(spark, "C14-two-nullable-inputs", "cudf_coalescing", "cudf_coalescing(nseed, nb)", true);
+
+            // Arities the binding has never been run at.
+            runValueCase(spark, "C15-four-inputs", "cudf_four_input", "cudf_four_input(c, a, b, d)", false, true);
+            runValueCase(spark, "C16-five-inputs", "cudf_five_input", "cudf_five_input(a, b, c, a, b)", false);
+            // A boolean result column, and a boolean input column.
+            runValueCase(spark, "C17-boolean-output", "cudf_is_lucky", "cudf_is_lucky(c)", false);
+            runValueCase(spark, "C18-boolean-input-and-output", "cudf_both_boolean", "cudf_both_boolean(t, c)", false);
+            runValueCase(spark, "C19-nullable-boolean-output", "cudf_nullable_boolean", "cudf_nullable_boolean(nseed)", true);
 
             checkProviderProducedCuda();
             printDecisions();
@@ -431,7 +526,11 @@ public final class CudfTransformIntegrationTest {
                 "cast((id >> 3) & 255 as int) as b",
                 "id * 7 + 1 as c",
                 "cast(id & 15 as float) as f",
-                "cast(id & 31 as double) + 0.5 as d");
+                "cast(id & 31 as double) + 0.5 as d",
+                // A boolean input column. cast(0/1 as boolean) rather than a comparison, so the
+                // column is a plain non-nullable BOOL8 rather than the result of an expression
+                // RAPIDS might choose to evaluate on the CPU.
+                "cast(id & 1 as boolean) as t");
     }
 
     /**

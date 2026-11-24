@@ -284,6 +284,8 @@ final class AsmUdfLowering {
             case LONG -> load ? Opcodes.LLOAD : Opcodes.LSTORE;
             case FLOAT -> load ? Opcodes.FLOAD : Opcodes.FSTORE;
             case DOUBLE -> load ? Opcodes.DLOAD : Opcodes.DSTORE;
+            // A boolean is an int everywhere in the JVM's instruction set.
+            case BOOL -> load ? Opcodes.ILOAD : Opcodes.ISTORE;
         };
     }
 
@@ -300,6 +302,7 @@ final class AsmUdfLowering {
             case LONG -> Opcodes.LRETURN;
             case FLOAT -> Opcodes.FRETURN;
             case DOUBLE -> Opcodes.DRETURN;
+            case BOOL -> Opcodes.IRETURN;
         };
     }
 

@@ -443,6 +443,9 @@ class AdversarialRegressionTest {
             case LONG -> ((uk.ac.manchester.tornado.api.types.arrays.LongArray) column).get(0);
             case FLOAT -> ((uk.ac.manchester.tornado.api.types.arrays.FloatArray) column).get(0);
             case DOUBLE -> ((DoubleArray) column).get(0);
+            // The runtime backend this helper exercises refuses a boolean result, because
+            // TornadoVM has no BooleanArray; there is no column here to read.
+            case BOOL -> throw new IllegalStateException("the runtime backend has no boolean column");
         };
     }
 

@@ -26,6 +26,8 @@ import java.util.List;
 import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.api.java.UDF3;
+import org.apache.spark.sql.api.java.UDF4;
+import org.apache.spark.sql.api.java.UDF5;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.junit.jupiter.api.Test;
@@ -110,6 +112,26 @@ class GeneralizedTransformTest {
                 () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 2), cuda));
     }
 
+    /** Four inputs of three different widths. */
+    public static final class FourInputUdf implements UDF4<Long, Integer, Integer, Double, Double> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Double call(Long a, Integer b, Integer c, Double d) {
+            return a + b.doubleValue() * c + d;
+        }
+    }
+
+    /** Five inputs. */
+    public static final class FiveInputUdf implements UDF5<Integer, Integer, Long, Integer, Integer, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Integer a, Integer b, Long c, Integer d, Integer e) {
+            return ((c * 31L + a) * 31L + b) * 31L + d + e;
+        }
+    }
+
     @Test
     void threeInputsCompile() {
         TcCudaCompiler.Result result = compile(new ThreeInputUdf(),
@@ -120,6 +142,43 @@ class GeneralizedTransformTest {
                 () -> assertTrue(cuda.contains("__device__ void GENERIC_TRANSFORM_OP(long long *"), () -> "signature was:\n" + cuda),
                 () -> assertTrue(cuda.contains("for") || cuda.contains("while"), () -> "the loop should survive:\n" + cuda),
                 () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 3), cuda));
+    }
+
+    /**
+     * Four and five inputs.
+     *
+     * <p>
+     * There is no arity limit anywhere in this code -- the analyzer, the generator, the compiler
+     * and the executor all walk the input list -- but "there is no limit" was, until these two
+     * cases, a claim about a path that had only ever been run with one, two and three columns. The
+     * {@link CudaSourceCheck} assertion is the load-bearing one: it is the same check the executor
+     * applies before handing the source to cudf, so it says the generated signature really would
+     * bind at that arity.
+     * </p>
+     */
+    @Test
+    void fourInputsCompile() {
+        TcCudaCompiler.Result result = compile(new FourInputUdf(),
+                List.of(DataTypes.LongType, DataTypes.IntegerType, DataTypes.IntegerType, DataTypes.DoubleType),
+                DataTypes.DoubleType);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains("__device__ void GENERIC_TRANSFORM_OP(double *"), () -> "signature was:\n" + cuda),
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 4), cuda),
+                () -> assertTrue(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 3) != null, cuda));
+    }
+
+    @Test
+    void fiveInputsCompile() {
+        TcCudaCompiler.Result result = compile(new FiveInputUdf(),
+                List.of(DataTypes.IntegerType, DataTypes.IntegerType, DataTypes.LongType, DataTypes.IntegerType, DataTypes.IntegerType),
+                DataTypes.LongType);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains("__device__ void GENERIC_TRANSFORM_OP(long long *"), () -> "signature was:\n" + cuda),
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 5), cuda));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -178,7 +237,9 @@ class GeneralizedTransformTest {
                 () -> assertEquals(ai.rapids.cudf.DType.INT32, PrimitiveKind.INT.cudfType()),
                 () -> assertEquals(ai.rapids.cudf.DType.INT64, PrimitiveKind.LONG.cudfType()),
                 () -> assertEquals(ai.rapids.cudf.DType.FLOAT32, PrimitiveKind.FLOAT.cudfType()),
-                () -> assertEquals(ai.rapids.cudf.DType.FLOAT64, PrimitiveKind.DOUBLE.cudfType()));
+                () -> assertEquals(ai.rapids.cudf.DType.FLOAT64, PrimitiveKind.DOUBLE.cudfType()),
+                () -> assertEquals(ai.rapids.cudf.DType.BOOL8, PrimitiveKind.BOOL.cudfType()),
+                () -> assertEquals(PrimitiveKind.BOOL, PrimitiveKind.ofSparkType(DataTypes.BooleanType)));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -380,6 +441,101 @@ class GeneralizedTransformTest {
         String nullableKey = KernelIdentity.of(resolved, nullable.inputs(), nullable.outputKind())
                 + (nullable.reportsArithmeticErrors() ? "+errc" : "") + (nullable.isNullAware() ? "+null" : "");
         assertFalse(plainKey.equals(nullableKey), "the null-aware compilation needs its own cache entry");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Booleans
+    //
+    // cuDF's BOOL8 is one byte per value and its jit kernel instantiates the device function with
+    // C++ `bool`, so the signature TC emits has to say `bool` and not `char` or `signed char` --
+    // a pointer of the wrong type does not convert, and the failure would be a nvrtc error at the
+    // first batch rather than anything the planner could catch. That is what these tests pin.
+    // ---------------------------------------------------------------------------------------
+
+    /** A boolean result. */
+    public static final class IsLuckyUdf implements UDF1<Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Long v) {
+            return (v % 7L) == 0L;
+        }
+    }
+
+    /** A boolean input as well as a boolean result. */
+    public static final class BothBooleanUdf implements UDF2<Boolean, Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Boolean flag, Long v) {
+            return flag ? (v % 3L) == 0L : (v % 5L) == 0L;
+        }
+    }
+
+    /** A boolean result that can be absent. */
+    public static final class NullableBooleanUdf implements UDF1<Long, Boolean> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Boolean call(Long v) {
+            if (v == null) {
+                return null;
+            }
+            return (v % 4L) == 1L;
+        }
+    }
+
+    @Test
+    void aBooleanResultCompilesToABoolOutputPointer() {
+        TcCudaCompiler.Result result = compile(new IsLuckyUdf(), List.of(DataTypes.LongType), DataTypes.BooleanType);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains("__device__ void GENERIC_TRANSFORM_OP(bool *"), () -> "signature was:\n" + cuda),
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 1), cuda));
+    }
+
+    @Test
+    void aBooleanInputIsCarriedAsABool() {
+        TcCudaCompiler.Result result = compile(new BothBooleanUdf(),
+                List.of(DataTypes.BooleanType, DataTypes.LongType), DataTypes.BooleanType);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains("__device__ void GENERIC_TRANSFORM_OP(bool *out, bool "), () -> "signature was:\n" + cuda),
+                () -> assertNull(CudaSourceCheck.check(cuda, TcCudaCompiler.ENTRY_SYMBOL, 2), cuda));
+    }
+
+    @Test
+    void aNullableBooleanResultCompilesToAnOptionalBool() {
+        TcCudaCompiler.Result result = compileNullAware(new NullableBooleanUdf(), List.of(DataTypes.LongType), DataTypes.BooleanType);
+        assertNull(result.refusal(), result::refusal);
+        String cuda = result.source();
+        assertAll(
+                () -> assertTrue(cuda.contains("cuda::std::optional<bool> *out"), () -> "signature was:\n" + cuda),
+                () -> assertTrue(cuda.contains("cuda::std::nullopt"), () -> "the null return should reach a nullopt:\n" + cuda));
+    }
+
+    /**
+     * Boxing a boolean is lowered; everything else on {@code Boolean} is still refused.
+     *
+     * <p>
+     * {@code Boolean} is not a {@code Number}, so unlike the four numeric boxes it has no
+     * converting accessors -- there is no widening or narrowing a boolean can undergo. The table
+     * therefore carries exactly two entries for it, and this says the third kind of call is still
+     * refused rather than guessed at.
+     * </p>
+     */
+    @Test
+    void onlyTheExactBooleanBoxCallsAreLowered() {
+        assertAll(
+                () -> assertTrue(BoxConversions.isSupportedBox("java/lang/Boolean")),
+                () -> assertTrue(BoxConversions.isKnown(new org.objectweb.asm.tree.MethodInsnNode(
+                        org.objectweb.asm.Opcodes.INVOKESTATIC, "java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;"))),
+                () -> assertTrue(BoxConversions.isKnown(new org.objectweb.asm.tree.MethodInsnNode(
+                        org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/Boolean", "booleanValue", "()Z"))),
+                () -> assertFalse(BoxConversions.isKnown(new org.objectweb.asm.tree.MethodInsnNode(
+                        org.objectweb.asm.Opcodes.INVOKESTATIC, "java/lang/Boolean", "logicalXor", "(ZZ)Z"))));
     }
 
     // ---------------------------------------------------------------------------------------

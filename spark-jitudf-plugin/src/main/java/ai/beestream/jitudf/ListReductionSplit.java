@@ -195,6 +195,8 @@ public final class ListReductionSplit {
             case LONG -> Opcodes.LADD;
             case FLOAT -> Opcodes.FADD;
             case DOUBLE -> Opcodes.DADD;
+            // A fold that sums booleans has no meaning; the split refuses such a UDF earlier.
+            case BOOL -> throw new IllegalStateException("a list reduction cannot sum booleans");
         };
     }
 
@@ -204,6 +206,7 @@ public final class ListReductionSplit {
             case LONG -> Opcodes.LLOAD;
             case FLOAT -> Opcodes.FLOAD;
             case DOUBLE -> Opcodes.DLOAD;
+            case BOOL -> throw new IllegalStateException("a list reduction cannot sum booleans");
         };
     }
 
@@ -213,6 +216,7 @@ public final class ListReductionSplit {
             case LONG -> Opcodes.LSTORE;
             case FLOAT -> Opcodes.FSTORE;
             case DOUBLE -> Opcodes.DSTORE;
+            case BOOL -> throw new IllegalStateException("a list reduction cannot sum booleans");
         };
     }
 
@@ -222,6 +226,7 @@ public final class ListReductionSplit {
             case LONG -> Opcodes.LRETURN;
             case FLOAT -> Opcodes.FRETURN;
             case DOUBLE -> Opcodes.DRETURN;
+            case BOOL -> throw new IllegalStateException("a list reduction cannot sum booleans");
         };
     }
 }

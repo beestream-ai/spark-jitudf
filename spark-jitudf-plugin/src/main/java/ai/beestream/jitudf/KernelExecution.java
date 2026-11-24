@@ -137,6 +137,10 @@ final class KernelExecution implements AutoCloseable {
             case LONG -> LongArray.cudaDeviceView(rows);
             case FLOAT -> FloatArray.cudaDeviceView(rows);
             case DOUBLE -> DoubleArray.cudaDeviceView(rows);
+            // TornadoVM has no BooleanArray, which is why the runtime backend refuses a boolean
+            // result in TornadoUdfProvider. Reaching here means that refusal was removed.
+            case BOOL -> throw new IllegalStateException(
+                    "the TornadoVM runtime backend cannot carry a boolean column; it should have been refused while planning");
         };
     }
 

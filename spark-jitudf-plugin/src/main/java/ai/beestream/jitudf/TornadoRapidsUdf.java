@@ -249,6 +249,8 @@ public final class TornadoRapidsUdf implements RapidsUDF, Serializable {
             case LONG -> ai.rapids.cudf.Scalar.fromLong(0L);
             case FLOAT -> ai.rapids.cudf.Scalar.fromFloat(0f);
             case DOUBLE -> ai.rapids.cudf.Scalar.fromDouble(0d);
+            case BOOL -> throw new IllegalStateException(
+                    "the TornadoVM runtime backend cannot carry a boolean column; it should have been refused while planning");
         };
     }
 

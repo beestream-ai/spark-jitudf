@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
 
 /**
  * The driver side, and the one entry point the RAPIDS fork calls.
@@ -108,6 +109,15 @@ public final class TornadoUdfProvider {
             // null-aware mode and a binding that passes cuda::std::optionals, which is the widened
             // ColumnView.transform. The TornadoVM runtime backend has neither and keeps refusing.
             boolean canRunNullAware = BACKEND_CUDF_TRANSFORM.equals(backend());
+            // A boolean result reaches cuDF as BOOL8, one byte per value, which the generalized
+            // binding carries like any other fixed-width type. The TornadoVM runtime backend
+            // cannot: it stages results in a TornadoVM native array and there is no BooleanArray.
+            // Refused here, while it is still a planning decision and the query simply stays where
+            // it was, rather than at the point where a byte array would have to stand in for one.
+            if (!BACKEND_CUDF_TRANSFORM.equals(backend()) && DataTypes.BooleanType.equals(outputType)) {
+                return refuse(name, "this UDF returns boolean, which the TornadoVM runtime backend cannot carry; "
+                        + "the cudf-transform backend can (set -Dtornado.spark.backend=cudf-transform)");
+            }
             EligibilityResult eligibility = CompilePhases.time(CompilePhases.Phase.ANALYSE,
                     () -> UdfEligibilityAnalyzer.analyse(resolvedUdf, List.of(inputTypes), outputType, inputsNullable, deterministic, canReportArithmeticErrors, canRunNullAware));
             if (!eligibility.isEligible()) {
