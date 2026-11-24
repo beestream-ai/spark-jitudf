@@ -187,13 +187,24 @@ public final class CudfTransformBenchmark {
         SparkSession spark = IntegrationTest.session(1000);
         try {
             System.out.println("  master = " + spark.sparkContext().master()
-                    + "  defaultParallelism = " + spark.sparkContext().defaultParallelism());
+                    + "  defaultParallelism = " + spark.sparkContext().defaultParallelism()
+                    + "  sourcePartitions = " + parts(spark)
+                    + "  shufflePartitions = " + spark.conf().get("spark.sql.shuffle.partitions")
+                    + "  batchSizeBytes = " + spark.conf().get("spark.rapids.sql.batchSizeBytes")
+                    + "  adaptive = " + spark.conf().get("spark.sql.adaptive.enabled"));
+            System.out.println("  jvm = " + System.getProperty("java.vm.name") + " " + System.getProperty("java.version")
+                    + "  args = " + java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments());
+            String kernelCache = System.getenv("LIBCUDF_KERNEL_CACHE_PATH");
+            java.io.File[] cached = kernelCache == null ? null : new java.io.File(kernelCache).listFiles();
+            System.out.println("  LIBCUDF_KERNEL_CACHE_PATH = " + kernelCache + "  entries before run = " + (cached == null ? "n/a" : cached.length)
+                    + "  warm iterations = " + warm + "  rowBased measured = " + ROW_BASED_REQUESTED);
             spark.udf().register("b_collatz", new CollatzUdf(), DataTypes.IntegerType);
             spark.udf().register("b_bucket", new BucketUdf(), DataTypes.IntegerType);
             spark.udf().register("b_active", new ActiveDaysUdf(), DataTypes.IntegerType);
             spark.udf().register("b_blend", new BlendUdf(), DataTypes.LongType);
             spark.udf().register("b_null_collatz", new NullDefaultingUdf(), DataTypes.IntegerType);
 
+            negativeControl(spark);
             collatz(spark, collatzRows, warm);
             bucketing(spark, otherRows, warm);
             bitmap(spark, otherRows, warm);
@@ -281,7 +292,7 @@ public final class CudfTransformBenchmark {
      * Two input columns, which the old binding could not pass at all.
      *
      * <p>
-     * Measured against the RAPIDS row-based fallback as well as CPU Spark, because the fallback is
+     * Measured against the RAPIDS CPU-bridge fallback as well as CPU Spark, because the fallback is
      * what this UDF got before: RAPIDS accepted the query, put the scan and the aggregate on the
      * GPU, and moved every batch back to the host to call the UDF row by row.
      * </p>
@@ -352,7 +363,9 @@ public final class CudfTransformBenchmark {
      */
     private enum Mode {
         CPU("CPU Spark"),
-        RAPIDS_FALLBACK("RAPIDS, UDF on CPU"),
+        RAPIDS_FALLBACK("RAPIDS + GpuCpuBridge"),
+        /** NVIDIA's explicit row-based operator, measured only when asked for (bench.rowBased=true). */
+        ROW_BASED("RAPIDS + GpuRowBasedScalaUDF"),
         TC_CUDF("TC -> cudf::transform");
 
         final String label;
@@ -376,21 +389,34 @@ public final class CudfTransformBenchmark {
         return Math.max(2, spark.sparkContext().defaultParallelism());
     }
 
-    private static long time(SparkSession spark, String query, boolean gpu, int warm) {
-        return time(spark, query, gpu ? Mode.TC_CUDF : Mode.CPU, warm);
+    /** Every timed sample, their median, and the executed plan of the last timed query. */
+    record Timing(long medianMs, List<Long> samplesMs, String plan) {
     }
 
-    private static long time(SparkSession spark, String query, Mode mode, int warm) {
+    private static long time(SparkSession spark, String query, boolean gpu, int warm) {
+        return time(spark, query, gpu ? Mode.TC_CUDF : Mode.CPU, warm).medianMs();
+    }
+
+    /**
+     * Times {@code query} in {@code mode}. The plan returned is the executed (final, adaptive) plan
+     * of the last timed query itself, not of a separate action, so the path it shows is the path
+     * the samples measured.
+     */
+    private static Timing time(SparkSession spark, String query, Mode mode, int warm) {
         configure(spark, mode);
         spark.sql(query).collect();                      // warm the JIT, the plan and cudf's kernel cache
         List<Long> times = new ArrayList<>();
+        Dataset<Row> last = null;
         for (int i = 0; i < warm; i++) {
             long t0 = System.nanoTime();
-            spark.sql(query).collect();
+            last = spark.sql(query);
+            last.collect();
             times.add((System.nanoTime() - t0) / 1_000_000);
         }
-        times.sort(Long::compare);
-        return times.get(times.size() / 2);
+        List<Long> sorted = new ArrayList<>(times);
+        sorted.sort(Long::compare);
+        String plan = last == null ? "" : last.queryExecution().executedPlan().toString();
+        return new Timing(sorted.get(sorted.size() / 2), times, plan);
     }
 
     private static long scalar(SparkSession spark, String query, boolean gpu) {
@@ -402,23 +428,60 @@ public final class CudfTransformBenchmark {
     private static void configure(SparkSession spark, Mode mode) {
         spark.conf().set("spark.rapids.sql.enabled", String.valueOf(mode != Mode.CPU));
         spark.conf().set("spark.rapids.sql.tornadovm.enabled", String.valueOf(mode == Mode.TC_CUDF));
+        spark.conf().set("spark.rapids.sql.rowBasedUDF.enabled", String.valueOf(mode == Mode.ROW_BASED));
     }
 
-    /** Whether the UDF really ran where the mode says it did, read out of the physical plan. */
-    private static String where(SparkSession spark, String query, String udf, Mode mode) {
-        configure(spark, mode);
-        Dataset<Row> df = spark.sql(query);
-        df.collect();
-        String plan = df.queryExecution().executedPlan().toString();
-        if (mode == Mode.CPU) {
-            return plan.contains("Gpu") ? "UNEXPECTED: a GPU operator in the CPU configuration" : "all CPU";
-        }
+    /**
+     * Why {@code plan} is not the path {@code mode} is meant to measure, or null when it is.
+     *
+     * <p>
+     * A sample taken on the wrong path is not a slower or faster sample of the right one; it is a
+     * measurement of something else. So the caller does not print it and carry on: it fails the
+     * run before the number is reported.
+     * </p>
+     */
+    static String unexpectedPath(String plan, String udf, Mode mode) {
+        boolean anyGpu = plan.contains("Gpu");
         boolean onGpu = plan.contains("gpu_" + udf);
-        boolean bridged = plan.contains("GpuCpuBridge") || plan.contains("GpuRowBasedScalaUDF");
-        if (mode == Mode.TC_CUDF) {
-            return onGpu && !bridged ? "UDF on GPU" : "UNEXPECTED: onGpu=" + onGpu + " bridged=" + bridged;
+        boolean bridge = plan.contains("GpuCpuBridge");
+        // RAPIDS prints GpuRowBasedScalaUDF as gpu_row_based_<name>; the class name never appears in
+        // a plan, so a check for it alone could not fail.
+        boolean rowBased = plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_");
+        return switch (mode) {
+            case CPU -> anyGpu ? "a GPU operator in the CPU configuration" : null;
+            case RAPIDS_FALLBACK -> bridge && !onGpu && !rowBased ? null : "expected GpuCpuBridge only: onGpu=" + onGpu + " bridge=" + bridge + " rowBased=" + rowBased;
+            case ROW_BASED -> rowBased && !onGpu && !bridge ? null : "expected GpuRowBasedScalaUDF only: onGpu=" + onGpu + " bridge=" + bridge + " rowBased=" + rowBased;
+            case TC_CUDF -> onGpu && !bridge && !rowBased ? null : "expected gpu_" + udf + " with no fallback: onGpu=" + onGpu + " bridge=" + bridge + " rowBased=" + rowBased;
+        };
+    }
+
+    /** Times one configuration and fails the run if the measured plan took any other path. */
+    private static Timing measured(SparkSession spark, String query, String udf, Mode mode, int warm) {
+        Timing timing = time(spark, query, mode, warm);
+        String problem = unexpectedPath(timing.plan(), udf, mode);
+        check(udf + " / " + mode.label + ": the timed queries took the intended path", problem == null, problem + "\n" + timing.plan());
+        if (problem != null) {
+            throw new IllegalStateException("UNEXPECTED PATH for " + udf + " in " + mode + ": " + problem + "; this sample is not a measurement of that configuration");
         }
-        return bridged ? "UDF row-based on CPU inside a GPU plan" : "UNEXPECTED: no row-based fallback found";
+        return timing;
+    }
+
+    /**
+     * Shows that the path check catches what it is for: with the provider's class name pointing
+     * nowhere, the TC configuration falls back to the bridge, and the check must say so.
+     */
+    private static void negativeControl(SparkSession spark) {
+        String key = "spark.rapids.sql.tornadovm.provider";
+        String previous = spark.conf().get(key, "ai.beestream.jitudf.TornadoUdfProvider");
+        spark.conf().set(key, "ai.beestream.jitudf.NoSuchProvider");
+        try {
+            String query = "select sum(b_collatz(id + 1)) as total from range(0, 10000, 1, 2)";
+            Timing timing = time(spark, query, Mode.TC_CUDF, 1);
+            String problem = unexpectedPath(timing.plan(), "b_collatz", Mode.TC_CUDF);
+            check("negative control: with no provider the TC configuration is detected as not on the GPU", problem != null, timing.plan());
+        } finally {
+            spark.conf().set(key, previous);
+        }
     }
 
     private static void report(String label, long rows, long cpuMs, long gpuMs) {
@@ -426,19 +489,32 @@ public final class CudfTransformBenchmark {
                 label, rows, cpuMs, gpuMs, cpuMs / (double) gpuMs);
     }
 
-    /** One workload across all three configurations, with where each one actually ran. */
+    /** One workload across the configurations, each sample on a path checked from its own plan. */
     private static void report3(String label, String udf, SparkSession spark, String query, long rows, int warm) {
-        long cpu = time(spark, query, Mode.CPU, warm);
-        long fallback = time(spark, query, Mode.RAPIDS_FALLBACK, warm);
-        long ours = time(spark, query, Mode.TC_CUDF, warm);
+        Timing cpu = measured(spark, query, udf, Mode.CPU, warm);
+        Timing bridge = measured(spark, query, udf, Mode.RAPIDS_FALLBACK, warm);
+        Timing rowBased = ROW_BASED_REQUESTED ? measured(spark, query, udf, Mode.ROW_BASED, warm) : null;
+        Timing ours = measured(spark, query, udf, Mode.TC_CUDF, warm);
         System.out.printf("  %-18s rows=%,d%n", label, rows);
-        System.out.printf("      %-22s %6d ms            (%s)%n", Mode.CPU.label, cpu, where(spark, query, udf, Mode.CPU));
-        System.out.printf("      %-22s %6d ms  %5.2fx   (%s)%n", Mode.RAPIDS_FALLBACK.label, fallback,
-                cpu / (double) fallback, where(spark, query, udf, Mode.RAPIDS_FALLBACK));
-        System.out.printf("      %-22s %6d ms  %5.2fx   (%s)%n", Mode.TC_CUDF.label, ours,
-                cpu / (double) ours, where(spark, query, udf, Mode.TC_CUDF));
-        System.out.printf("      against the RAPIDS fallback: %.2fx%n", fallback / (double) ours);
+        line(Mode.CPU, cpu, cpu);
+        line(Mode.RAPIDS_FALLBACK, bridge, cpu);
+        if (rowBased != null) {
+            line(Mode.ROW_BASED, rowBased, cpu);
+        }
+        line(Mode.TC_CUDF, ours, cpu);
+        System.out.printf("      against the RAPIDS CPU bridge (GpuCpuBridge): %.2fx%n", bridge.medianMs() / (double) ours.medianMs());
+        if (rowBased != null) {
+            System.out.printf("      against RAPIDS row-based (GpuRowBasedScalaUDF): %.2fx%n", rowBased.medianMs() / (double) ours.medianMs());
+        }
     }
+
+    private static void line(Mode mode, Timing timing, Timing cpu) {
+        System.out.printf("      %-32s %6d ms  %5.2fx vs CPU   samples=%s  (path verified)%n", mode.label, timing.medianMs(),
+                cpu.medianMs() / (double) timing.medianMs(), timing.samplesMs());
+    }
+
+    /** Whether to also measure NVIDIA's explicit row-based operator; off so a standard run is unchanged. */
+    private static final boolean ROW_BASED_REQUESTED = Boolean.getBoolean("bench.rowBased");
 
     private static void check(String what, boolean ok, String detail) {
         checks++;

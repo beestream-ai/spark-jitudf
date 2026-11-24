@@ -300,7 +300,7 @@ public final class CodexDifferentialTest {
         compare(label, cpu, gpu);
         String plan = plan(spark, source, call);
         check(label + ": the UDF runs on the GPU as gpu_" + udf, plan.contains("gpu_" + udf), firstLines(plan));
-        check(label + ": no CPU bridge or row-based UDF", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+        check(label + ": no CPU bridge or row-based UDF", !plan.contains("GpuCpuBridge") && !(plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_")), firstLines(plan));
     }
 
     private static void expectFallback(SparkSession spark, String label, String udf, Dataset<Row> source, String call) {

@@ -162,7 +162,7 @@ public final class SaltSearch {
      */
     private enum Variant {
         CPU_UDF2("CPU Spark, two-input Java UDF", false, false, true),
-        RAPIDS_FALLBACK_UDF2("RAPIDS, two-input UDF row-based on CPU", true, false, true),
+        RAPIDS_FALLBACK_UDF2("RAPIDS, two-input UDF via GpuCpuBridge", true, false, true),
         TC_CUDF_UDF2("TC -> cudf::transform, two-input UDF", true, true, true),
         TC_CUDF_UDF1_XOR("TC -> cudf::transform, one-input UDF + SQL XOR", true, true, true),
         GPU_BUILTIN_HASH("RAPIDS built-in hash (seed 42, DIFFERENT HASH)", true, true, false);
@@ -200,12 +200,12 @@ public final class SaltSearch {
     }
 
     /** One salt's exact aggregates. Every field is an exact integer, so engines must agree. */
-    private record Aggregates(long salt, long bucketSum, long nA, long nB,
+    record Aggregates(long salt, long bucketSum, long nA, long nB,
             long s1a, long s1b, long q1a, long q1b,
             long s2a, long s2b, long q2a, long q2b) {
     }
 
-    private record Ranked(long salt, double maxT) {
+    record Ranked(long salt, double maxT) {
     }
 
     public static void main(String[] args) {
@@ -365,11 +365,11 @@ public final class SaltSearch {
             Dataset<Row> df = stats(spark, users, salts, v);
             df.collect();
             String plan = df.queryExecution().executedPlan().toString();
-            boolean bridged = plan.contains("GpuCpuBridge") || plan.contains("GpuRowBasedScalaUDF");
+            boolean bridged = plan.contains("GpuCpuBridge") || (plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_"));
             switch (v) {
                 case CPU_UDF2 -> check(v.label + ": no GPU operator at all", !plan.contains("Gpu"), firstLines(plan));
-                case RAPIDS_FALLBACK_UDF2 -> check(v.label + ": the UDF really is row-based on the CPU",
-                        bridged, "expected a bridge and found none: " + firstLines(plan));
+                case RAPIDS_FALLBACK_UDF2 -> check(v.label + ": the UDF really runs on the CPU through GpuCpuBridge",
+                        plan.contains("GpuCpuBridge") && !plan.contains("gpu_" + v.udfName()), "expected GpuCpuBridge and found none: " + firstLines(plan));
                 case TC_CUDF_UDF2, TC_CUDF_UDF1_XOR -> {
                     check(v.label + ": gpu_" + v.udfName() + " in the plan", plan.contains("gpu_" + v.udfName()), firstLines(plan));
                     check(v.label + ": no CPU bridge", !bridged, firstLines(plan));
@@ -384,7 +384,7 @@ public final class SaltSearch {
                 decision.contains("cudf-transform") && decision.contains("[LONG, LONG]"), "decision: " + decision);
     }
 
-    private static List<Ranked> rank(List<Aggregates> aggregates) {
+    static List<Ranked> rank(List<Aggregates> aggregates) {
         List<Ranked> ranked = new ArrayList<>();
         for (Aggregates a : aggregates) {
             double t1 = welch(a.nA(), a.s1a(), a.q1a(), a.nB(), a.s1b(), a.q1b());
@@ -400,17 +400,35 @@ public final class SaltSearch {
         return ranked;
     }
 
-    /** Welch's t from exact counts, sums and sums of squares; 0 when a variance is undefined. */
-    private static double welch(long na, long sa, long qa, long nb, long sb, long qb) {
+    /**
+     * Welch's t from exact counts, sums and sums of squares.
+     *
+     * <p>
+     * The salts are ranked by the smallest |t|, so the degenerate cases decide whether a salt that
+     * cannot be shown balanced is ranked as perfectly balanced. This used to return 0 for all of
+     * them, which put such a salt first. Now:
+     * </p>
+     * <ul>
+     * <li>an arm with fewer than two rows has no variance, and nothing says its mean matches the
+     * other arm's: +infinity, the worst rank;</li>
+     * <li>both arms constant (zero standard error): 0 if the means are equal, which really is no
+     * difference, and +/-infinity if they differ, which is a separation no noise can explain;</li>
+     * <li>a variance that rounding takes slightly below zero is zero.</li>
+     * </ul>
+     */
+    static double welch(long na, long sa, long qa, long nb, long sb, long qb) {
         if (na < 2 || nb < 2) {
-            return 0;
+            return Double.POSITIVE_INFINITY;
         }
         double ma = sa / (double) na;
         double mb = sb / (double) nb;
-        double va = (qa - na * ma * ma) / (na - 1);
-        double vb = (qb - nb * mb * mb) / (nb - 1);
+        double va = Math.max(0, (qa - na * ma * ma) / (na - 1));
+        double vb = Math.max(0, (qb - nb * mb * mb) / (nb - 1));
         double denominator = Math.sqrt(va / na + vb / nb);
-        return denominator == 0 ? 0 : (ma - mb) / denominator;
+        if (denominator == 0) {
+            return ma == mb ? 0 : (ma > mb ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY);
+        }
+        return (ma - mb) / denominator;
     }
 
     private static List<Long> topThree(List<Ranked> ranked) {

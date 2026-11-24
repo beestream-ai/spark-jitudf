@@ -460,7 +460,7 @@ public final class CudfTransformIntegrationTest {
         // GpuCpuBridge is the fallback that evaluates the UDF on the CPU inside a GPU plan, and
         // GpuRowBasedScalaUDF is the row-by-row path. Either means the UDF did not go through cudf.
         // GpuColumnarToRow is not a fallback: it is how any GPU plan hands rows back to collect().
-        check(label + ": no CPU fallback for the UDF", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+        check(label + ": no CPU fallback for the UDF", !plan.contains("GpuCpuBridge") && !(plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_")), firstLines(plan));
     }
 
     /**
@@ -490,7 +490,7 @@ public final class CudfTransformIntegrationTest {
         }
         check("C4-activity-bitmap-list: every row identical to CPU Spark", mismatches == 0 && cpu.size() == gpu.size(), mismatches + " rows differ");
         String plan = plan(spark, rows, "cudf_bitmap_list", true);
-        check("C4-activity-bitmap-list: no CPU fallback", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+        check("C4-activity-bitmap-list: no CPU fallback", !plan.contains("GpuCpuBridge") && !(plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_")), firstLines(plan));
     }
 
     /**
@@ -620,7 +620,7 @@ public final class CudfTransformIntegrationTest {
 
         String plan = planFor(spark, rowsOf(spark, nullable), call);
         check(label + ": the UDF itself runs on the GPU", plan.contains("gpu_" + udf), firstLines(plan));
-        check(label + ": no CPU fallback for the UDF", !plan.contains("GpuCpuBridge") && !plan.contains("GpuRowBasedScalaUDF"), firstLines(plan));
+        check(label + ": no CPU fallback for the UDF", !plan.contains("GpuCpuBridge") && !(plan.contains("GpuRowBasedScalaUDF") || plan.contains("gpu_row_based_")), firstLines(plan));
     }
 
     /** The row count the session was built with, so the two datasets stay the same size. */
