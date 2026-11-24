@@ -211,8 +211,10 @@ final class AsmUdfLowering {
                     throw new IllegalStateException("unexpected instanceof " + test.desc + " in a method the analysis accepted");
                 }
                 // CastProof established that the value is exactly this box, and over a non-null
-                // column it is present, so the test is true.
-                out.add(new InsnNode(Opcodes.POP));
+                // column it is present, so the test is true. The value on the stack is now the
+                // primitive, which for Long and Double is two slots wide.
+                boolean wide = test.desc.equals("java/lang/Long") || test.desc.equals("java/lang/Double");
+                out.add(new InsnNode(wide ? Opcodes.POP2 : Opcodes.POP));
                 out.add(new InsnNode(Opcodes.ICONST_1));
             }
             case Opcodes.ARRAYLENGTH -> {

@@ -123,6 +123,18 @@ class CastAndStateSemanticsTest {
         accepted(new CoverageCorpus.ValidCasts(), List.of(I, L), L, new Object[][] { { 3, 4L } });
     }
 
+    public static final class InstanceofDouble implements UDF2<Double, Integer, Integer> {
+        @Override
+        public Integer call(Double d, Integer i) {
+            return (d instanceof Double ? 10 : 0) + i;
+        }
+    }
+
+    @Test
+    void aProvenInstanceofOnAWideValueLowersToValidCode() throws Exception {
+        accepted(new InstanceofDouble(), List.of(D, I), I, new Object[][] { { 1.5, 2 }, { -0.0, -7 } });
+    }
+
     @Test
     void castsThatCanFailAreDeclinedAndJavaReallyThrows() {
         refused(new CoverageCorpus.BadCast(), new DataType[] { I, I }, I, "throws ClassCastException", new Object[] { 1, 2 });
