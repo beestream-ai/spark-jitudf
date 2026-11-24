@@ -256,7 +256,7 @@ class CastAndStateSemanticsTest {
         assertEquals(0, LoweredOracle.reference(new Replaced(), 1), "executors run Other.call");
         ProviderHarness.Outcome o = ProviderHarness.cudf(new Replaced(), new DataType[] { I }, I, false, "replaced");
         assertFalse(o.accepted(), o::decision);
-        assertTrue(o.decision().contains("replaced during serialization"), o::decision);
+        assertTrue(o.decision().contains("writeReplace"), o::decision);
     }
 
     /** Every deserialization gives a different value: nothing about it is a constant. */

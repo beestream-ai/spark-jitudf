@@ -42,16 +42,28 @@ class CoverageMatrixTest {
         TornadoUdfProvider.resetDecisions();
         List<String> rows = new ArrayList<>();
         List<String> violations = new ArrayList<>();
-        rows.add("id\tintent\tresult\tpattern\tdecision");
+        rows.add("id\tintent\tresult\tcheck\tpattern\tdecision");
         for (CoverageCorpus.Case c : CoverageCorpus.all()) {
             ProviderHarness.Outcome o = ProviderHarness.cudf(c.function(), c.inputs(), c.output(), c.nullable(), c.id(), c.incompatibleOps());
             String result = o.accepted() ? "GPU" : "CPU";
-            rows.add(c.id() + "\t" + c.intent() + "\t" + result + "\t" + c.pattern() + "\t" + o.decision());
+            // An acceptance only counts if the code is right: a row whose CUDA fails its check is WRONG.
+            String check = "-";
+            if (o.accepted() && c.check() != null) {
+                boolean precision = c.checkName().startsWith("precision:");
+                check = c.check().test(o.cuda()) ? "ok" : (precision ? "IMPRECISE(" : "WRONG(") + c.checkName() + ")";
+            }
+            rows.add(c.id() + "\t" + c.intent() + "\t" + result + "\t" + check + "\t" + c.pattern() + "\t" + o.decision());
             if (c.intent() == CoverageCorpus.Intent.SAFE && !o.accepted()) {
                 violations.add(c.id() + " (" + c.pattern() + ") lost GPU eligibility: " + o.decision());
             }
+            if (check.startsWith("WRONG") || check.startsWith("IMPRECISE")) {
+                violations.add(c.id() + " (" + c.pattern() + ") is accepted with the wrong code: " + check + "\n" + o.cuda());
+            }
             if (c.intent() == CoverageCorpus.Intent.UNSAFE && o.accepted()) {
                 violations.add(c.id() + " (" + c.pattern() + ") is still accepted: " + o.decision());
+            }
+            if (c.intent() == CoverageCorpus.Intent.GAP && o.accepted()) {
+                violations.add(c.id() + " (" + c.pattern() + ") is now accepted: verify it against Java and reclassify it as SAFE");
             }
         }
         Path out = Path.of("target", "coverage-matrix.tsv");

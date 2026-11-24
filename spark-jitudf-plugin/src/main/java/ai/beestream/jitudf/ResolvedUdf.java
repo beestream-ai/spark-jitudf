@@ -27,12 +27,37 @@ public final class ResolvedUdf {
     private final Method method;
     private final Class<?> declaringClass;
     private final byte[] classFile;
+    private final boolean nullSensitiveAdapter;
 
     public ResolvedUdf(Object instance, Method method, Class<?> declaringClass, byte[] classFile) {
+        this(instance, method, declaringClass, classFile, false);
+    }
+
+    private ResolvedUdf(Object instance, Method method, Class<?> declaringClass, byte[] classFile, boolean nullSensitiveAdapter) {
         this.instance = instance;
         this.method = method;
         this.declaringClass = declaringClass;
         this.classFile = classFile;
+        this.nullSensitiveAdapter = nullSensitiveAdapter;
+    }
+
+    /**
+     * This UDF as reached through a forwarding wrapper that boxes a primitive argument or unboxes
+     * the result: exact for every value except null, where the wrapper raises (or yields zero) and
+     * the method itself would not. Such a UDF must not be compiled over a nullable column.
+     */
+    ResolvedUdf withNullSensitiveAdapter() {
+        return new ResolvedUdf(instance, method, declaringClass, classFile, true);
+    }
+
+    /** Whether a wrapper on the way here treats null differently from the method itself. */
+    public boolean nullSensitiveAdapter() {
+        return nullSensitiveAdapter;
+    }
+
+    /** The same UDF with its class file replaced (by constant folding); everything else carried over. */
+    ResolvedUdf withClassFile(byte[] rewritten) {
+        return new ResolvedUdf(instance, method, declaringClass, rewritten, nullSensitiveAdapter);
     }
 
     /** The UDF object, or {@code null} for a static implementation. */

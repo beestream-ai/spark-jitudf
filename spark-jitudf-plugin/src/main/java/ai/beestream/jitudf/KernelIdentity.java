@@ -48,8 +48,10 @@ final class KernelIdentity {
      * that kernels cached by an older version of this code are never reused by a newer one.
      * 3: casts proven before erasure, instanceof folded, fields folded from the serialized copy,
      * JDK-body effects deciding error reporting.
+     * 4: methods resolved by virtual dispatch (the declaring class can be a superclass), fields
+     * folded only when executor-invariant, divisors judged on every path.
      */
-    private static final String LOWERING_VERSION = "3";
+    private static final String LOWERING_VERSION = "4";
 
     private KernelIdentity() {
     }

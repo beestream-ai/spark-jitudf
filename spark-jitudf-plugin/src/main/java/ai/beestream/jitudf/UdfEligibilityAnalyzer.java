@@ -187,6 +187,13 @@ public final class UdfEligibilityAnalyzer {
         // choice is between refusing a UDF that would have run correctly and compiling it in the
         // mode that can express the test. The second costs an optional per value and is right.
         boolean nullAware = canRunNullAware && (inputsNullable || entryTestsForNull(udf));
+        if (nullAware && udf.nullSensitiveAdapter()) {
+            // The method is reached through a wrapper that boxes an argument or unboxes the result.
+            // For every value that is exact; for a null it is not -- the wrapper raises (or, in
+            // Scala, yields zero) where the compiled method would pass the null on.
+            return EligibilityResult.ineligible("the UDF is reached through a wrapper that unboxes a value, which treats null differently from the method it "
+                    + "forwards to, and nulls are in play here");
+        }
         if (inputsNullable && !canRunNullAware) {
             // Not "not implemented yet": the obvious implementation is unsound here, and the measurement
             // is in bench/NullSemanticsProbe. Spark skips a UDF and yields null for a null argument only
@@ -490,6 +497,8 @@ public final class UdfEligibilityAnalyzer {
         }
         String owner = classNode.name;
         AbstractInsnNode[] instructions = method.instructions.toArray();
+        // What every divisor can be, on every path that reaches its division (see DivisorFacts).
+        DivisorFacts divisors = DivisorFacts.of(owner, method);
         for (int i = 0; i < instructions.length; i++) {
             AbstractInsnNode insn = instructions[i];
             int op = insn.getOpcode();
@@ -500,7 +509,7 @@ public final class UdfEligibilityAnalyzer {
                 usesFloatingPoint[0] = true;
             }
             if (ALLOWED_OPCODES.contains(op)) {
-                String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op, canReportArithmeticErrors, needsErrorReporting);
+                String divisionProblem = checkDivision(insn, divisorOf(divisors, method, insn), op, canReportArithmeticErrors, needsErrorReporting);
                 if (divisionProblem != null) {
                     return divisionProblem;
                 }
@@ -510,7 +519,7 @@ public final class UdfEligibilityAnalyzer {
                 // Integer division and remainder are allowed only where the divisor is provably
                 // non-zero, because the device has no way to raise Java's ArithmeticException.
                 case Opcodes.IDIV, Opcodes.IREM, Opcodes.LDIV, Opcodes.LREM -> {
-                    String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op, canReportArithmeticErrors, needsErrorReporting);
+                    String divisionProblem = checkDivision(insn, divisorOf(divisors, method, insn), op, canReportArithmeticErrors, needsErrorReporting);
                     if (divisionProblem != null) {
                         return divisionProblem;
                     }
@@ -524,7 +533,7 @@ public final class UdfEligibilityAnalyzer {
                 case Opcodes.ALOAD -> {
                     int slot = ((org.objectweb.asm.tree.VarInsnNode) insn).var;
                     if (slot == 0 && (method.access & Opcodes.ACC_STATIC) == 0) {
-                        return "the UDF uses this to reach an instance field, which is state the kernel does not have";
+                        return "the UDF uses this to reach an instance field or an instance method, which is state or dynamic dispatch the kernel does not have";
                     }
                     if (!referenceSlots.contains(slot)) {
                         return "the UDF loads a reference from local slot " + slot + ", which is not one of its arguments";
@@ -599,7 +608,7 @@ public final class UdfEligibilityAnalyzer {
                     if (call.owner.startsWith("java/") && !BoxConversions.isKnown(call)) {
                         // TC compiles this call by inlining (or intrinsifying) the JDK's own body, so
                         // what that body can do is part of what this UDF does.
-                        String effectProblem = checkJdkCallEffects(call, i > 0 ? previousReal(instructions, i) : null, canReportArithmeticErrors, needsErrorReporting,
+                        String effectProblem = checkJdkCallEffects(call, divisorOf(divisors, method, insn), canReportArithmeticErrors, needsErrorReporting,
                                 usesFloatingPoint);
                         if (effectProblem != null) {
                             return effectProblem;
@@ -621,11 +630,13 @@ public final class UdfEligibilityAnalyzer {
      * <p>
      * {@code Math.floorDiv} and {@code Math.floorMod} get one refinement, because they are what a
      * bucketing UDF is made of and their contract is narrow: they throw exactly when the divisor --
-     * their last argument -- is zero. A non-zero constant there means they cannot throw, as
-     * {@code x % 1000} cannot, and no error channel is needed.
+     * their last argument, the top of the stack at the call -- is zero. When the data-flow facts
+     * show it non-zero on every path to the call they cannot throw, as {@code x % 1000} cannot,
+     * and no error channel is needed. "On every path" is the point: a constant on one branch of a
+     * conditional says nothing about the other.
      * </p>
      */
-    private static String checkJdkCallEffects(MethodInsnNode call, AbstractInsnNode previous, boolean canReportArithmeticErrors, boolean[] needsErrorReporting,
+    private static String checkJdkCallEffects(MethodInsnNode call, DivisorFacts.Fact divisor, boolean canReportArithmeticErrors, boolean[] needsErrorReporting,
             boolean[] usesFloatingPoint) {
         ComputationEffects.Effects effects = ComputationEffects.ofJdkCall(call);
         if (effects.usesFloatingPoint()) {
@@ -636,11 +647,8 @@ public final class UdfEligibilityAnalyzer {
         }
         boolean floorFamily = call.owner.equals("java/lang/Math") || call.owner.equals("java/lang/StrictMath");
         floorFamily &= call.name.equals("floorDiv") || call.name.equals("floorMod");
-        if (floorFamily) {
-            Long divisor = constantOf(previous);
-            if (divisor != null && divisor != 0) {
-                return null;
-            }
+        if (floorFamily && divisorIsSafe(divisor, canReportArithmeticErrors)) {
+            return null;
         }
         if (canReportArithmeticErrors) {
             needsErrorReporting[0] = true;
@@ -650,70 +658,59 @@ public final class UdfEligibilityAnalyzer {
                 + "Java would raise ArithmeticException and this backend cannot";
     }
 
-    /** The instruction before index {@code i} that is a real opcode, or null. */
-    private static AbstractInsnNode previousReal(AbstractInsnNode[] instructions, int i) {
-        for (int j = i - 1; j >= 0; j--) {
-            if (instructions[j].getOpcode() >= 0) {
-                return instructions[j];
-            }
+    /** The fact about the divisor of {@code insn} -- the value on top of the stack -- or unknown. */
+    private static DivisorFacts.Fact divisorOf(DivisorFacts divisors, MethodNode method, AbstractInsnNode insn) {
+        return divisors == null ? DivisorFacts.Fact.unknown(1) : divisors.operand(method, insn, 0);
+    }
+
+    /**
+     * Whether a division by {@code divisor} needs no zero test.
+     *
+     * <p>
+     * On the cudf backend, non-zero on every path is enough: TC compiles Java's division through
+     * {@code java_idiv}/{@code java_irem}, which give Java's wrapped answer for
+     * {@code MIN_VALUE / -1} instead of C++'s undefined behaviour. The TornadoVM runtime backend has
+     * no such helper and no error channel, so it keeps the rule it always had: an exact constant
+     * other than zero and minus one.
+     * </p>
+     */
+    private static boolean divisorIsSafe(DivisorFacts.Fact divisor, boolean cudfBackend) {
+        if (cudfBackend) {
+            return divisor.provablyNonZero();
         }
-        return null;
+        return divisor.isConstant() && divisor.constant != 0 && divisor.constant != -1;
     }
 
     /**
      * Integer division and remainder divide by zero on the device without raising anything, so the
-     * query would silently get a number where Java raises {@code ArithmeticException}. They are
-     * admitted only when the divisor is a non-zero constant sitting directly in front of them.
+     * query would silently get a number where Java raises {@code ArithmeticException}. A divisor
+     * the data-flow facts show non-zero on every path needs nothing; any other divisor is compiled
+     * with a zero test that raises on a backend that can report it, and refused on one that
+     * cannot.
      */
-    private static String checkDivision(AbstractInsnNode insn, AbstractInsnNode previous, int op, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
+    private static String checkDivision(AbstractInsnNode insn, DivisorFacts.Fact divisor, int op, boolean canReportArithmeticErrors, boolean[] needsErrorReporting) {
         if (op != Opcodes.IDIV && op != Opcodes.IREM && op != Opcodes.LDIV && op != Opcodes.LREM) {
             return null;
         }
-        Long divisor = constantOf(previous);
-        if (divisor == null) {
-            if (canReportArithmeticErrors) {
-                // The divisor may be zero on some row, and the backend can say so: compile with
-                // error reporting on and let cudf raise for the call, which fails the query the way
-                // Java's ArithmeticException would.
-                needsErrorReporting[0] = true;
-                return null;
-            }
-            return "the UDF divides by a value this analysis cannot prove non-zero; Java would raise ArithmeticException and a kernel cannot";
-        }
-        if (divisor == 0) {
-            return "the UDF divides by the constant zero";
-        }
-        if (divisor == -1) {
-            // Integer.MIN_VALUE / -1 overflows and, in Java, wraps rather than raising; the device
-            // agrees only by accident, so it is refused rather than reasoned about.
-            return "the UDF divides by the constant -1, whose overflow behaviour is not established here";
-        }
-        return null;
-    }
-
-    /** The constant an instruction pushes, or null when it does not push one. */
-    private static Long constantOf(AbstractInsnNode insn) {
-        if (insn == null) {
+        if (divisorIsSafe(divisor, canReportArithmeticErrors)) {
             return null;
         }
-        int op = insn.getOpcode();
-        if (op >= Opcodes.ICONST_M1 && op <= Opcodes.ICONST_5) {
-            return (long) (op - Opcodes.ICONST_0);
+        if (canReportArithmeticErrors) {
+            // The divisor may be zero on some row, and the backend can say so: compile with error
+            // reporting on and let cudf raise for the call, which fails the query the way Java's
+            // ArithmeticException would.
+            needsErrorReporting[0] = true;
+            return null;
         }
-        if (op == Opcodes.LCONST_0) {
-            return 0L;
+        if (divisor.isConstant() && divisor.constant == 0) {
+            return "the UDF divides by the constant zero";
         }
-        if (op == Opcodes.LCONST_1) {
-            return 1L;
+        if (divisor.isConstant() && divisor.constant == -1) {
+            // Integer.MIN_VALUE / -1 overflows and, in Java, wraps rather than raising; this backend
+            // has no helper that guarantees the same, so it is refused rather than reasoned about.
+            return "the UDF divides by the constant -1, whose overflow behaviour the TornadoVM runtime backend does not guarantee";
         }
-        if (op == Opcodes.BIPUSH || op == Opcodes.SIPUSH) {
-            return (long) ((org.objectweb.asm.tree.IntInsnNode) insn).operand;
-        }
-        if (op == Opcodes.LDC && ((org.objectweb.asm.tree.LdcInsnNode) insn).cst instanceof Number n
-                && (((org.objectweb.asm.tree.LdcInsnNode) insn).cst instanceof Integer || ((org.objectweb.asm.tree.LdcInsnNode) insn).cst instanceof Long)) {
-            return n.longValue();
-        }
-        return null;
+        return "the UDF divides by a value this analysis cannot prove non-zero on every path; Java would raise ArithmeticException and a kernel cannot";
     }
 
     /**

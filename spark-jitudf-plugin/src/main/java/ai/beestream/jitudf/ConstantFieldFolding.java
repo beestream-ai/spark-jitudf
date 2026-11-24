@@ -29,48 +29,63 @@ import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /**
- * Replaces a UDF's {@code final} primitive instance fields with the values an executor will see.
+ * Replaces a UDF's {@code final} primitive instance fields with the values an executor will see,
+ * when -- and only when -- Java serialization fixes those values on the driver.
  *
  * <p>
  * A UDF configured through its constructor is the ordinary way people write one:
  * {@code spark.udf().register("f", new ScoringUdf(weight, cutoff), ...)}. The body then reads
- * {@code this.weight}, which is state, and state is exactly what a kernel does not have -- so until
- * now every such UDF was refused for using {@code this}.
+ * {@code this.weight}, which is state, and state is exactly what a kernel does not have. Folding
+ * the field into the bytecode as a constant turns a refused UDF into an ordinary one. The cache key
+ * falls out right: two instances with different values fold to different bytes and so to different
+ * kernels.
+ * </p>
+ *
+ * <h2>Which value an executor sees</h2>
+ *
+ * <p>
+ * Spark ships the UDF by Java serialization; the object an executor runs is the one
+ * <em>deserialization in the executor's JVM</em> produces. That is not "the driver's value", and it
+ * is not "what a round trip on the driver produces" either: code that runs during deserialization
+ * runs on the executor, against the executor's properties, environment and classpath, and two
+ * agreeing round trips on the driver say nothing about it. (Codex's counterexample:
+ * {@code readResolve} rebuilds the UDF from {@code Integer.getInteger("review.factor", 9)}; the
+ * driver folds 9, an executor started with the property at 77 computes {@code x + 77}.)
  * </p>
  *
  * <p>
- * It need not be state. The instance exists on the driver while the query is being planned, the
- * field is {@code final}, and so its value is a constant from the kernel's point of view. Reading
- * it here and folding it into the bytecode turns a refused UDF into an ordinary one.
+ * So the criterion is the serialization protocol itself (Java Object Serialization Specification
+ * section 3). A field's executor value is fixed on the driver exactly when no code of the UDF's
+ * runs on the executor to produce it:
+ * </p>
+ * <ul>
+ * <li>the class that declares it is {@code Serializable} -- a field of a non-serializable
+ * superclass is set by that superclass's no-argument constructor, which runs on the executor;</li>
+ * <li>no class in the object's chain defines {@code readObjectNoData} or {@code writeReplace},
+ * none is {@code Externalizable}, and the declaring class does not narrow its stream with
+ * {@code serialPersistentFields} -- each of those is code or a rule this class does not follow;</li>
+ * <li>with no hook at all, the stream carries the value the driver wrote, and default
+ * deserialization assigns it unchanged: a non-{@code transient} field has the driver instance's
+ * value, and a {@code transient} one has its type's default (zero, false), whatever the
+ * constructor set;</li>
+ * <li>{@code writeObject}, {@code readObject} and {@code readResolve} declared by the class itself
+ * are followed only when their bytecode, and that of the constructors they run, is a pure function
+ * of the object's own primitive state moved through the stream's field API
+ * ({@link #whyNotDeterministic}): then running them on the driver gives what every executor gets,
+ * and the values are read from that round trip. A hook that consults anything else -- a system
+ * property, the environment, reflection, a static -- leaves the fields unfolded.</li>
+ * </ul>
+ *
+ * <p>
+ * Anything else is left unfolded, and the analysis then refuses the field read as before: the UDF
+ * stays on the CPU, where the executor's own deserialization decides the value. Only fields are at
+ * stake there -- the computation the class's bytecode describes is the same in every JVM.
  * </p>
  *
  * <p>
- * This runs before anything else looks at the code, which is what keeps it cheap. The eligibility
- * analysis, the lowering, both kernel generators and the cache key all read the class file this
- * produces, so none of them needs to know that a field was ever involved. The cache key in
- * particular is the right thing to fall out: two instances of the same class with different field
- * values fold to different bytes, so they get different kernels instead of one silently serving the
- * other.
- * </p>
- *
- * <p>
- * Only the exact pattern {@code ALOAD 0; GETFIELD} is folded, only for {@code final} primitive
- * fields of the UDF's own class, and only when the instance is available. Anything else is left
- * alone for the analysis to refuse as it did before.
- * </p>
- *
- * <p>
- * <strong>Which value.</strong> Not the driver object's. Spark ships the UDF to executors by Java
- * serialization, and the object an executor runs is the one that comes out of it. A
- * {@code final transient} field set by the constructor is 9 on the driver and 0 on every executor;
- * a custom {@code readObject} can set a field to something else again; {@code writeReplace} or
- * {@code readResolve} can substitute another object altogether. So the instance is put through a
- * serialization round trip here, exactly the contract Spark uses, and the values are read from the
- * restored copy. The round trip is done twice and a field is folded only when both copies agree,
- * so a {@code readObject} that is not deterministic leaves its field unfolded (and the UDF refused
- * for reading state) rather than frozen at one arbitrary value. If serialization fails, or yields an
- * object of another class, nothing is folded and {@link #executorViewProblem} says why the UDF must
- * not be compiled at all.
+ * Which <em>class</em> an executor runs is a separate question, answered by
+ * {@link #executorViewProblem}: {@code writeReplace} and {@code readResolve} can substitute another
+ * object, and then the analysed method is not the one that runs.
  * </p>
  */
 public final class ConstantFieldFolding {
@@ -79,16 +94,16 @@ public final class ConstantFieldFolding {
     }
 
     /**
-     * {@code udf} with its final primitive instance fields folded, or {@code udf} unchanged when
-     * there is nothing to fold or the instance is not available (a static Scala lambda).
+     * {@code udf} with its foldable final primitive instance fields folded, or {@code udf}
+     * unchanged when there is nothing to fold or the instance is not available (a static lambda).
      */
     public static ResolvedUdf fold(ResolvedUdf udf) {
         Object instance = udf.instance();
         if (instance == null) {
             return udf;
         }
-        Object[] views = executorViews(instance);
-        if (views == null) {
+        Object executorView = executorView(instance);
+        if (executorView == null) {
             return udf;
         }
         ClassNode node = new ClassNode();
@@ -96,7 +111,7 @@ public final class ConstantFieldFolding {
 
         int folded = 0;
         for (MethodNode method : node.methods) {
-            folded += foldIn(method, node.name, views);
+            folded += foldIn(method, node.name, udf.declaringClass(), executorView, executorView != instance);
         }
         if (folded == 0) {
             return udf;
@@ -108,46 +123,307 @@ public final class ConstantFieldFolding {
             }
         };
         node.accept(writer);
-        return new ResolvedUdf(instance, udf.method(), udf.declaringClass(), writer.toByteArray());
+        return udf.withClassFile(writer.toByteArray());
     }
 
     /**
      * Why an instance-based UDF cannot be compiled from its driver-side class at all, or null.
      *
      * <p>
-     * The compiled code is the driver class's {@code call}. If serialization fails, Spark cannot
-     * ship the UDF and the CPU plan fails; if it produces an object of another class, executors
-     * run that class's {@code call}. Either way the driver's bytecode is not the computation.
+     * The compiled code is a method of the instance's class. If serialization fails, Spark cannot
+     * ship the UDF and the CPU plan fails too, so there is nothing to compile. If
+     * {@code writeReplace} or {@code readResolve} can hand the executor an object of another class,
+     * the executor runs that class's method, and which class it is can depend on the executor
+     * (its properties, its classpath). {@code writeReplace} is refused outright. A
+     * {@code readResolve} is accepted when its own bytecode proves the class cannot change: the
+     * class is {@code final} and every value it returns is {@code this} or a {@code new} instance of
+     * that same class. Its fields are then still not folded (see {@link #fold}).
      * </p>
      */
     public static String executorViewProblem(Object instance) {
         if (instance == null) {
             return null;
         }
-        try {
-            Object restored = roundTrip(instance);
-            if (restored == null || restored.getClass() != instance.getClass()) {
-                return "the UDF object is replaced during serialization (writeReplace/readResolve) by "
-                        + (restored == null ? "null" : restored.getClass().getName()) + ", so executors do not run the method that was analysed";
+        Class<?> type = instance.getClass();
+        if (findHook(type, "writeReplace", "()Ljava/lang/Object;") != null) {
+            return "the UDF object defines writeReplace, so what executors deserialize is whatever that returns, not the class that was analysed";
+        }
+        Class<?> resolver = findHook(type, "readResolve", "()Ljava/lang/Object;");
+        if (resolver != null) {
+            String why = whyReadResolveMayChangeClass(type, resolver);
+            if (why != null) {
+                return "the UDF object defines readResolve, which runs on each executor and " + why + ", so executors may not run the method that was analysed";
             }
+        }
+        try {
+            roundTrip(instance);
             return null;
         } catch (Exception | LinkageError e) {
             return "the UDF object does not survive the Java serialization Spark ships it with: " + e;
         }
     }
 
-    /** Two independent serialization round trips of {@code instance}, or null if either fails. */
-    static Object[] executorViews(Object instance) {
-        try {
-            Object first = roundTrip(instance);
-            Object second = roundTrip(instance);
-            if (first == null || second == null || first.getClass() != instance.getClass() || second.getClass() != instance.getClass()) {
-                return null;
+    /**
+     * The serialization hook or rule in {@code type}'s chain that this class never follows when
+     * folding, named for a diagnostic; null when there is none. {@code readObject},
+     * {@code writeObject} and {@code readResolve} are not listed: they are followed when their
+     * bytecode is deterministic (see {@link #executorView}).
+     */
+    static String hookThatDecidesFields(Class<?> type) {
+        if (java.io.Externalizable.class.isAssignableFrom(type)) {
+            return "Externalizable";
+        }
+        for (String[] hook : new String[][] { { "readObjectNoData", "()V" }, { "writeReplace", "()Ljava/lang/Object;" } }) {
+            Class<?> owner = findHook(type, hook[0], hook[1]);
+            if (owner != null) {
+                return owner.getName() + "." + hook[0];
             }
-            return new Object[] { first, second };
+        }
+        return null;
+    }
+
+    /**
+     * The class in {@code type}'s chain declaring a non-static method {@code name desc}, or null.
+     * Private hooks apply to their own class only, inherited non-private ones to subclasses; either
+     * way their presence anywhere in the chain is what matters here, so any declaration counts.
+     */
+    private static Class<?> findHook(Class<?> type, String name, String desc) {
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Method method : c.getDeclaredMethods()) {
+                if (method.getName().equals(name) && !Modifier.isStatic(method.getModifiers())
+                        && org.objectweb.asm.Type.getMethodDescriptor(method).equals(desc)) {
+                    return c;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Why {@code readResolve} (declared in {@code owner}) might return an object of another class
+     * than {@code type}, or null when its bytecode shows it cannot.
+     */
+    private static String whyReadResolveMayChangeClass(Class<?> type, Class<?> owner) {
+        if (!Modifier.isFinal(type.getModifiers())) {
+            return "the class is not final, so a new instance of it says nothing about the class of the result";
+        }
+        byte[] bytes = UdfResolver.classFileOf(owner);
+        if (bytes == null) {
+            return "its bytecode could not be read";
+        }
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, ClassReader.SKIP_FRAMES);
+        MethodNode method = null;
+        for (MethodNode candidate : node.methods) {
+            if (candidate.name.equals("readResolve") && candidate.desc.equals("()Ljava/lang/Object;")) {
+                method = candidate;
+            }
+        }
+        if (method == null || method.instructions.size() == 0) {
+            return "its bytecode could not be read";
+        }
+        String self = org.objectweb.asm.Type.getInternalName(type);
+        for (AbstractInsnNode insn : method.instructions) {
+            if (insn instanceof VarInsnNode store && store.getOpcode() == Opcodes.ASTORE && store.var == 0) {
+                return "reassigns this";
+            }
+        }
+        org.objectweb.asm.tree.analysis.Frame<org.objectweb.asm.tree.analysis.SourceValue>[] frames;
+        try {
+            frames = new org.objectweb.asm.tree.analysis.Analyzer<>(new org.objectweb.asm.tree.analysis.SourceInterpreter()).analyze(node.name, method);
+        } catch (org.objectweb.asm.tree.analysis.AnalyzerException e) {
+            return "its bytecode could not be analysed (" + e.getMessage() + ")";
+        }
+        AbstractInsnNode[] code = method.instructions.toArray();
+        for (int i = 0; i < code.length; i++) {
+            if (code[i].getOpcode() == Opcodes.ATHROW) {
+                continue; // a failed deserialization fails the task on the CPU plan too
+            }
+            if (code[i].getOpcode() != Opcodes.ARETURN || frames[i] == null) {
+                continue;
+            }
+            org.objectweb.asm.tree.analysis.Frame<org.objectweb.asm.tree.analysis.SourceValue> frame = frames[i];
+            if (!onlyThisOrNewSelf(frame.getStack(frame.getStackSize() - 1), method, frames, self, 0)) {
+                return "can return something other than this or a new " + type.getSimpleName();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether every instruction that can have produced {@code value} is {@code aload_0} or a
+     * {@code new} of {@code self}, looking through the {@code dup} that a constructor call leaves.
+     */
+    private static boolean onlyThisOrNewSelf(org.objectweb.asm.tree.analysis.SourceValue value, MethodNode method,
+            org.objectweb.asm.tree.analysis.Frame<org.objectweb.asm.tree.analysis.SourceValue>[] frames, String self, int depth) {
+        if (depth > 8 || value.insns.isEmpty()) {
+            return false;
+        }
+        for (AbstractInsnNode source : value.insns) {
+            if (source instanceof VarInsnNode load && load.getOpcode() == Opcodes.ALOAD && load.var == 0) {
+                continue;
+            }
+            if (source instanceof org.objectweb.asm.tree.TypeInsnNode created && created.getOpcode() == Opcodes.NEW && created.desc.equals(self)) {
+                continue;
+            }
+            if (source.getOpcode() == Opcodes.DUP) {
+                org.objectweb.asm.tree.analysis.Frame<org.objectweb.asm.tree.analysis.SourceValue> before = frames[method.instructions.indexOf(source)];
+                if (before != null && onlyThisOrNewSelf(before.getStack(before.getStackSize() - 1), method, frames, self, depth + 1)) {
+                    continue;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The object whose fields an executor's copy will have, as far as the driver can know it: the
+     * instance itself under default deserialization, or what a deterministic {@code readResolve}
+     * builds from it. Null when some field-deciding code is not known to give the same answer in
+     * every JVM, in which case nothing is folded.
+     */
+    private static Object executorView(Object instance) {
+        Class<?> type = instance.getClass();
+        if (hookThatDecidesFields(type) != null) {
+            return null;
+        }
+        java.util.List<String> hooks = new java.util.ArrayList<>();
+        for (String[] hook : HOOKS) {
+            Class<?> owner = findHook(type, hook[0], hook[1]);
+            if (owner == null) {
+                continue;
+            }
+            if (owner != type) {
+                return null; // a hook inherited from, or declared in, another class of the chain
+            }
+            hooks.add(hook[0] + hook[1]);
+        }
+        if (hooks.isEmpty()) {
+            return instance;
+        }
+        if (whyNotDeterministic(type, hooks) != null) {
+            return null;
+        }
+        // Every hook is a deterministic function of the object's own primitive state and the
+        // stream: running them here -- writeObject as Spark's serialization will, readObject and
+        // readResolve as each executor will -- gives exactly what every executor gets.
+        try {
+            Object resolved = roundTrip(instance);
+            return resolved != null && resolved.getClass() == type ? resolved : null;
         } catch (Exception | LinkageError e) {
             return null;
         }
+    }
+
+    /** The per-class serialization hooks that are followed when their bytecode is deterministic. */
+    private static final String[][] HOOKS = { { "writeObject", "(Ljava/io/ObjectOutputStream;)V" }, { "readObject", "(Ljava/io/ObjectInputStream;)V" },
+            { "readResolve", "()Ljava/lang/Object;" } };
+
+    /**
+     * The calls on the serialization streams a deterministic hook may make: reading and writing the
+     * object's own fields through the stream's field API, and nothing that reaches outside it.
+     */
+    private static final java.util.Set<String> STREAM_CALLS = java.util.Set.of( //
+            "java/io/ObjectOutputStream.defaultWriteObject()V", "java/io/ObjectInputStream.defaultReadObject()V", //
+            "java/io/ObjectOutputStream.putFields()Ljava/io/ObjectOutputStream$PutField;", "java/io/ObjectOutputStream.writeFields()V", //
+            "java/io/ObjectOutputStream$PutField.put(Ljava/lang/String;I)V", "java/io/ObjectOutputStream$PutField.put(Ljava/lang/String;J)V", //
+            "java/io/ObjectOutputStream$PutField.put(Ljava/lang/String;Z)V", "java/io/ObjectOutputStream$PutField.put(Ljava/lang/String;F)V", //
+            "java/io/ObjectOutputStream$PutField.put(Ljava/lang/String;D)V");
+
+    /**
+     * Why the serialization hooks {@code hooks} of {@code type} might compute different fields in
+     * different JVMs (or at different times), or null when they cannot.
+     *
+     * <p>
+     * They cannot when each of them, and every constructor of the class they run, does nothing but
+     * arithmetic on the object's own primitive fields and constants, and moves fields through the
+     * stream's own field API ({@link #STREAM_CALLS}): no other method calls, no static fields, no
+     * reference fields, no arrays, no exceptions. Their inputs are then the object's state -- the
+     * driver's values, or the bytes the driver wrote -- and their result is a function of it
+     * alone, the same in every JVM. Anything that could consult the environment
+     * ({@code Integer.getInteger}, {@code System.getenv}, a clock, reflection, a static initialised
+     * per JVM) is a call or a static and is refused here.
+     * </p>
+     */
+    static String whyNotDeterministic(Class<?> type, java.util.List<String> hooks) {
+        if (type.getSuperclass() != Object.class) {
+            return "the class's state is spread over a class hierarchy";
+        }
+        byte[] bytes = UdfResolver.classFileOf(type);
+        if (bytes == null) {
+            return "its bytecode could not be read";
+        }
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, ClassReader.SKIP_FRAMES);
+        java.util.ArrayDeque<String> pending = new java.util.ArrayDeque<>(hooks);
+        java.util.Set<String> seen = new java.util.HashSet<>(pending);
+        while (!pending.isEmpty()) {
+            String key = pending.poll();
+            MethodNode method = null;
+            for (MethodNode candidate : node.methods) {
+                if ((candidate.name + candidate.desc).equals(key)) {
+                    method = candidate;
+                }
+            }
+            if (method == null) {
+                return key + " could not be read";
+            }
+            if (method.tryCatchBlocks != null && !method.tryCatchBlocks.isEmpty()) {
+                return key + " catches exceptions";
+            }
+            for (AbstractInsnNode insn : method.instructions) {
+                int op = insn.getOpcode();
+                if (op < 0) {
+                    continue;
+                }
+                if (insn instanceof org.objectweb.asm.tree.MethodInsnNode call) {
+                    if (call.getOpcode() == Opcodes.INVOKESPECIAL && call.name.equals("<init>") && call.owner.equals(node.name)) {
+                        if (seen.add(call.name + call.desc)) {
+                            pending.add(call.name + call.desc);
+                        }
+                        continue;
+                    }
+                    if (call.getOpcode() == Opcodes.INVOKESPECIAL && call.name.equals("<init>") && call.owner.equals("java/lang/Object") && call.desc.equals("()V")) {
+                        continue;
+                    }
+                    if (STREAM_CALLS.contains(call.owner + "." + call.name + call.desc)) {
+                        continue;
+                    }
+                    return key + " calls " + call.owner.replace('/', '.') + "." + call.name + ", which may depend on the JVM it runs in";
+                }
+                if (insn instanceof FieldInsnNode field) {
+                    if (op == Opcodes.GETSTATIC || op == Opcodes.PUTSTATIC) {
+                        return key + " uses the static field " + field.name + ", which each JVM initialises for itself";
+                    }
+                    if (!field.owner.equals(node.name) || kindOf(field.desc) == null) {
+                        return key + " uses the field " + field.name + ", which is not a primitive field of the class";
+                    }
+                    continue;
+                }
+                if (insn instanceof org.objectweb.asm.tree.TypeInsnNode t) {
+                    if (op == Opcodes.NEW && t.desc.equals(node.name)) {
+                        continue;
+                    }
+                    return key + " creates or tests " + t.desc.replace('/', '.');
+                }
+                switch (op) {
+                    case Opcodes.INVOKEDYNAMIC, Opcodes.NEWARRAY, Opcodes.ANEWARRAY, Opcodes.MULTIANEWARRAY, Opcodes.MONITORENTER, Opcodes.MONITOREXIT,
+                            Opcodes.IALOAD, Opcodes.LALOAD, Opcodes.FALOAD, Opcodes.DALOAD, Opcodes.AALOAD, Opcodes.BALOAD, Opcodes.CALOAD, Opcodes.SALOAD,
+                            Opcodes.IASTORE, Opcodes.LASTORE, Opcodes.FASTORE, Opcodes.DASTORE, Opcodes.AASTORE, Opcodes.BASTORE, Opcodes.CASTORE, Opcodes.SASTORE,
+                            Opcodes.ARRAYLENGTH, Opcodes.ATHROW:
+                        return key + " uses opcode " + op + ", which this check does not admit";
+                    case Opcodes.LDC:
+                        if (!(((LdcInsnNode) insn).cst instanceof Number) && !(((LdcInsnNode) insn).cst instanceof String)) {
+                            return key + " loads a constant that is neither a number nor a field name";
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        return null;
     }
 
     private static Object roundTrip(Object instance) throws java.io.IOException, ClassNotFoundException {
@@ -170,7 +446,7 @@ public final class ConstantFieldFolding {
         }
     }
 
-    private static int foldIn(MethodNode method, String owner, Object[] views) {
+    private static int foldIn(MethodNode method, String owner, Class<?> declaringClass, Object instance, boolean resolved) {
         int folded = 0;
         AbstractInsnNode insn = method.instructions.getFirst();
         while (insn != null) {
@@ -178,7 +454,7 @@ public final class ConstantFieldFolding {
             if (insn.getOpcode() == Opcodes.ALOAD && ((VarInsnNode) insn).var == 0
                     && next != null && next.getOpcode() == Opcodes.GETFIELD) {
                 FieldInsnNode get = (FieldInsnNode) next;
-                Number value = constantValue(owner, get, views);
+                Number value = constantValue(owner, declaringClass, get, instance, resolved);
                 if (value != null) {
                     AbstractInsnNode after = next.getNext();
                     method.instructions.remove(insn);
@@ -195,8 +471,23 @@ public final class ConstantFieldFolding {
         return folded;
     }
 
-    /** The field's value, when it is one this can safely treat as a constant; null otherwise. */
-    private static Number constantValue(String owner, FieldInsnNode get, Object[] views) {
+    /**
+     * The field {@code get} reads, resolved as the JVM resolves a field reference (JVMS 5.4.3.2):
+     * declared in the named class or inherited from a superclass.
+     */
+    private static Field resolveField(Class<?> declaringClass, FieldInsnNode get) {
+        for (Class<?> c = declaringClass; c != null; c = c.getSuperclass()) {
+            for (Field field : c.getDeclaredFields()) {
+                if (field.getName().equals(get.name) && org.objectweb.asm.Type.getDescriptor(field.getType()).equals(get.desc)) {
+                    return field;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The field's executor value, when serialization fixes it on the driver; null otherwise. */
+    private static Number constantValue(String owner, Class<?> declaringClass, FieldInsnNode get, Object instance, boolean resolved) {
         if (!get.owner.equals(owner)) {
             return null;
         }
@@ -205,25 +496,53 @@ public final class ConstantFieldFolding {
             return null;
         }
         try {
-            Field field = views[0].getClass().getDeclaredField(get.name);
-            if (!Modifier.isFinal(field.getModifiers()) || Modifier.isStatic(field.getModifiers())) {
+            Field field = resolveField(declaringClass, get);
+            if (field == null || !field.getDeclaringClass().isInstance(instance)) {
+                return null;
+            }
+            int mods = field.getModifiers();
+            if (!Modifier.isFinal(mods) || Modifier.isStatic(mods)) {
                 // A non-final field can change between planning and execution, and a value read now
                 // would be a guess about what it will be later.
                 return null;
             }
-            field.setAccessible(true);
-            Number first = asNumber(field.get(views[0]));
-            Number second = asNumber(field.get(views[1]));
-            if (first == null || second == null || !sameBits(first, second)) {
-                // Deserialization did not settle on one value: not a constant.
+            Class<?> fieldOwner = field.getDeclaringClass();
+            if (!java.io.Serializable.class.isAssignableFrom(fieldOwner)) {
+                // Set on the executor by the no-argument constructor of the first non-serializable
+                // superclass -- code that runs there, not a value the driver wrote.
                 return null;
             }
-            return first;
+            for (Field declared : fieldOwner.getDeclaredFields()) {
+                if (declared.getName().equals("serialPersistentFields") && Modifier.isStatic(declared.getModifiers())) {
+                    return null; // the stream's fields are not the class's fields
+                }
+            }
+            if (resolved) {
+                // The object readResolve built, whose fields its (pure) constructor set: read them.
+                field.setAccessible(true);
+                return asNumber(field.get(instance));
+            }
+            if (Modifier.isTransient(mods)) {
+                // Not in the stream at all: default deserialization leaves it at its type's default,
+                // whatever the driver's constructor put there.
+                return defaultOf(kind);
+            }
+            field.setAccessible(true);
+            return asNumber(field.get(instance));
         } catch (ReflectiveOperationException | RuntimeException e) {
             // Inaccessible under a module system or a security policy: leave the field alone and
             // let the analysis refuse the UDF as it would have before.
             return null;
         }
+    }
+
+    private static Number defaultOf(PrimitiveKind kind) {
+        return switch (kind) {
+            case LONG -> 0L;
+            case FLOAT -> 0.0f;
+            case DOUBLE -> 0.0d;
+            default -> 0;
+        };
     }
 
     private static Number asNumber(Object value) {
@@ -232,13 +551,6 @@ public final class ConstantFieldFolding {
             return b ? 1 : 0;
         }
         return value instanceof Number number ? number : null;
-    }
-
-    private static boolean sameBits(Number a, Number b) {
-        if (a instanceof Double || a instanceof Float) {
-            return Double.doubleToRawLongBits(a.doubleValue()) == Double.doubleToRawLongBits(b.doubleValue());
-        }
-        return a.longValue() == b.longValue() && a.getClass() == b.getClass();
     }
 
     private static PrimitiveKind kindOf(String descriptor) {

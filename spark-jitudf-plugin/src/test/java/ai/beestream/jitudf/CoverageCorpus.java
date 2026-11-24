@@ -38,11 +38,31 @@ import org.apache.spark.sql.types.DataTypes;
  */
 final class CoverageCorpus {
 
+    /**
+     * SAFE: the GPU result can equal Java's, and the pattern must be GPU-eligible. UNSAFE: its
+     * semantics cannot currently be preserved, and it must stay on the CPU. GAP: safe in principle
+     * but not yet supported -- a coverage gap, kept separate so that it is never counted as a
+     * correct refusal.
+     */
     enum Intent {
-        SAFE, UNSAFE
+        SAFE, UNSAFE, GAP
     }
 
-    record Case(String id, String pattern, Intent intent, Object function, DataType[] inputs, DataType output, boolean nullable, boolean incompatibleOps) {
+    /**
+     * One pattern. {@code check}, when present, is a property the emitted CUDA must have for an
+     * acceptance to be correct (the right method compiled, a zero test present or absent): an
+     * accepted row that fails it is wrong code, not coverage.
+     */
+    record Case(String id, String pattern, Intent intent, Object function, DataType[] inputs, DataType output, boolean nullable, boolean incompatibleOps,
+            String checkName, java.util.function.Predicate<String> check) {
+        Case(String id, String pattern, Intent intent, Object function, DataType[] inputs, DataType output, boolean nullable, boolean incompatibleOps) {
+            this(id, pattern, intent, function, inputs, output, nullable, incompatibleOps, null, null);
+        }
+    }
+
+    /** The error channel's zero test, for an int or a long divisor. */
+    static boolean zeroTest(String cuda) {
+        return java.util.regex.Pattern.compile("== 0(LL)?\\) return 2;").matcher(cuda).find();
     }
 
     static final DataType I = DataTypes.IntegerType;
@@ -463,6 +483,126 @@ final class CoverageCorpus {
         cases.add(new Case("U23", "Boolean predicate over sqrt, incompatibleOps off", Intent.UNSAFE, new ArithmeticEffectsTest.FpPredicate(), new DataType[] { I }, B, false, false));
         cases.add(new Case("U24", "double conversion inside INT->LONG, incompatibleOps off", Intent.UNSAFE, new ArithmeticEffectsTest.FpViaBoxConversion(), new DataType[] { I }, L, false, false));
         cases.add(new Case("U25", "LIST fold over doubles, incompatibleOps off", Intent.UNSAFE, new ListFoldSemanticsTest.DoubleSum(), new DataType[] { listD }, D, false, false));
+        addSecondReview(cases);
         return cases;
+    }
+
+    /**
+     * Codex's second review: inherited dispatch, forwarders, serialization hooks, conditional
+     * divisors. Rows S, U and G continue the numbering; checks make "accepted" mean "accepted
+     * with the right code".
+     */
+    static void addSecondReview(List<Case> cases) {
+        DataType listL = DataTypes.createArrayType(L, false);
+        org.apache.spark.sql.internal.ToScalaUDF$ adapt = org.apache.spark.sql.internal.ToScalaUDF$.MODULE$;
+        java.util.function.Predicate<String> plusOne = cuda -> cuda.contains("(unsigned int) 1)") && !cuda.contains("(unsigned int) 2)");
+        java.util.function.Predicate<String> guarded = CoverageCorpus::zeroTest;
+        java.util.function.Predicate<String> unguarded = cuda -> cuda.contains("__device__ void");
+
+        // ---- dispatch and forwarding
+        cases.add(new Case("S01", "inherited interface implementation (child adds nothing)", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.InheritingChild()), new DataType[] { I, I }, I, false, false, "computes x+1", plusOne));
+        cases.add(new Case("S02", "Codex A: child adds call(int,int) overload; Spark runs inherited call(Integer,Integer)", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.PrimitiveOverloadChild()), new DataType[] { I, I }, I, false, false, "computes x+1, not x+2", plusOne));
+        cases.add(new Case("S03", "child overrides the boxed call", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.OverridingChild()), new DataType[] { I, I }, I, false, false, "computes x*y", c -> c.contains("*")));
+        cases.add(new Case("S04", "child overrides and adds overloads on both sides", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.OverridingWithOverloads()), new DataType[] { I, I }, I, false, false, "computes x-y",
+                c -> c.contains("- (unsigned int) arg1") || c.contains("-")));
+        cases.add(new Case("S05", "generic base, bridge in the child, extra overload", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.BridgedChild()), new DataType[] { L }, I, false, false, "computes bitCount*3", c -> c.contains("* (unsigned int) 3")));
+        cases.add(new Case("S06", "implementation in a parent that fixes T, bridge followed by dispatch", Intent.SAFE,
+                adapt.apply(new DispatchResolutionTest.LongImplChild()), new DataType[] { L }, I, false, false, null, null));
+        DispatchResolutionTest.Popcount popcount = new DispatchResolutionTest.Popcount();
+        UDF1<Long, Integer> popcountInterface = popcount;
+        cases.add(new Case("S07", "Codex regression: typed forwarder Function1<Long,Integer> x -> inner.call(x)", Intent.SAFE,
+                (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x), new DataType[] { L }, I, false, false, null, null));
+        cases.add(new Case("S08", "erased forwarder Function1<Object,Object> x -> inner.call((Long) x)", Intent.SAFE,
+                (scala.Function1<Object, Object> & Serializable) x -> popcount.call((Long) x), new DataType[] { L }, I, false, false, null, null));
+        UDF1<Long, Integer> javaForwarder = x -> popcountInterface.call(x);
+        cases.add(new Case("S09", "Java UDF1 lambda forwarding through the interface, behind Spark's adapter", Intent.SAFE,
+                adapt.apply(javaForwarder), new DataType[] { L }, I, false, false, null, null));
+        UDF1<Long, Integer> javaLambda = x -> Long.bitCount(x) + 1;
+        cases.add(new Case("S10", "plain Java UDF1 lambda behind Spark's adapter", Intent.SAFE,
+                adapt.apply(javaLambda), new DataType[] { L }, I, false, false, null, null));
+        scala.runtime.java8.JFunction1$mcIJ$sp primitive = (scala.runtime.java8.JFunction1$mcIJ$sp & Serializable) x -> popcount.call(x);
+        cases.add(new Case("S11", "Scala-shaped primitive forwarder, non-nullable input", Intent.SAFE, primitive, new DataType[] { L }, I, false, false, null, null));
+        UDF1<Long, Integer> boundReference = popcount::call;
+        cases.add(new Case("S34", "bound method reference popcount::call behind Spark's adapter", Intent.SAFE, adapt.apply(boundReference), new DataType[] { L }, I,
+                false, false, null, null));
+        cases.add(new Case("U26", "typed wrapper that adds one to the forwarded result", Intent.UNSAFE,
+                (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x) + 1, new DataType[] { L }, I, false, false));
+        cases.add(new Case("U27", "forwarder with a side effect", Intent.UNSAFE, (scala.Function1<Long, Integer> & Serializable) x -> {
+            DispatchResolutionTest.sideEffect();
+            return popcount.call(x);
+        }, new DataType[] { L }, I, false, false));
+        cases.add(new Case("U28", "Scala-shaped primitive forwarder over a nullable input (unboxing null differs)", Intent.UNSAFE, primitive,
+                new DataType[] { L }, I, true, false));
+        cases.add(new Case("U29", "child overriding an instance helper the inherited call uses (dynamic dispatch in the body)", Intent.UNSAFE,
+                adapt.apply(new DispatchResolutionTest.TemplateChild()), new DataType[] { L }, L, false, false));
+        cases.add(new Case("G01", "implementation is an interface default method", Intent.GAP,
+                adapt.apply(new DispatchResolutionTest.UsesDefault()), new DataType[] { L }, I, false, false));
+        cases.add(new Case("G02", "typed wrapper computing on the forwarded result (x -> inner(x) * 2): compilable as a composition", Intent.GAP,
+                (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x) * 2, new DataType[] { L }, I, false, false));
+        int captured = 5;
+        UDF1<Integer, Integer> capturesPrimitive = x -> x + captured;
+        cases.add(new Case("G03", "Java UDF lambda capturing an effectively-final int", Intent.GAP, adapt.apply(capturesPrimitive), new DataType[] { I }, I, false, false));
+
+        // ---- constructor fields and serialization
+        cases.add(new Case("S12", "constructor-configured final int behind Spark's adapter", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.Offset(41)), new DataType[] { I }, I, false, false, "folds 41", c -> c.contains("41")));
+        cases.add(new Case("S13", "final long, boolean and int constants together", Intent.SAFE,
+                new ExecutorInvariantFieldsTest.Masked(0xFFFF_0000L, true, 16), new DataType[] { L }, L, false, false, null, null));
+        cases.add(new Case("S14", "final fields declared in a serializable parent", Intent.SAFE,
+                new ExecutorInvariantFieldsTest.DerivedOffset(4, -3), new DataType[] { I }, I, false, false, null, null));
+        cases.add(new Case("S15", "inherited call reading the parent's final fields, child adds an overload", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.ChildOfFields()), new DataType[] { I, I }, I, false, false, "folds 3 and 5", c -> c.contains("3") && c.contains("5")));
+        cases.add(new Case("S16", "readResolve returning this, call reads no field", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.PureResolveNoFields()), new DataType[] { I }, I, false, false, null, null));
+        cases.add(new Case("S17", "final transient field: executor value is 0", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.TransientFactor()), new DataType[] { I }, I, false, false, "does not fold 9", c -> !c.contains("9")));
+        cases.add(new Case("U30", "Codex B: readResolve rebuilds the field from a system property", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.ResolvedFactor(9)), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U31", "readObject overwrites the final field from a system property", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.ReadObjectFactor(9)), new DataType[] { I }, I, false, false));
+        cases.add(new Case("S32", "deterministic writeObject streams factor*100 (executor sees 900)", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.WrittenFactor(9)), new DataType[] { I }, I, false, false, "folds 900", c -> c.contains("900")));
+        cases.add(new Case("S33", "readObject that only calls defaultReadObject", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.DefaultReadObject(12)), new DataType[] { I }, I, false, false, "folds 12", c -> c.contains("12")));
+        cases.add(new Case("U33", "field of a non-serializable parent, set by its constructor on the executor", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.EnvironmentDerived()), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U34", "readResolve picks the class from a system property", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.ClassSwitch()), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U35", "final reference to a mutable array", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.MutableReference()), new DataType[] { I }, I, false, false));
+
+        // ---- conditional divisors
+        cases.add(new Case("S18", "Codex C: floorMod(x, x == 7 ? y : 3)", Intent.SAFE, new ConditionalDivisorTest.CondFloorMod(), new DataType[] { I, I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S19", "Codex C: floorDiv(x, x == 7 ? y : 3)", Intent.SAFE, new ConditionalDivisorTest.CondFloorDiv(), new DataType[] { I, I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S20", "long floorMod, constant on one branch, parameter on the other", Intent.SAFE, new ConditionalDivisorTest.CondFloorModLong(),
+                new DataType[] { L, L }, L, false, false, "zero test", guarded));
+        cases.add(new Case("S21", "zero on one branch of the divisor", Intent.SAFE, new ConditionalDivisorTest.ZeroOnOneBranch(), new DataType[] { I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S22", "divisor local assigned on three paths", Intent.SAFE, new ConditionalDivisorTest.LocalAssignedOnPaths(), new DataType[] { I, I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S23", "nested conditional divisor", Intent.SAFE, new ConditionalDivisorTest.NestedConditional(), new DataType[] { I, I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S24", "conditional divisor passed to a floorMod helper", Intent.SAFE, new ConditionalDivisorTest.ThroughHelper(), new DataType[] { I, I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S25", "divisor decremented around a loop back edge", Intent.SAFE, new ConditionalDivisorTest.LoopChangesDivisor(), new DataType[] { I }, I, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S26", "non-zero constants on both branches", Intent.SAFE, new ConditionalDivisorTest.NonZeroBothBranches(), new DataType[] { I }, I, false, false,
+                "precision: no zero test needed", unguarded));
+        cases.add(new Case("S27", "divisor y | 1 (never zero)", Intent.SAFE, new ConditionalDivisorTest.OrOne(), new DataType[] { I, I }, I, false, false,
+                "precision: no zero test needed", unguarded));
+        cases.add(new Case("S28", "division and remainder by constant -1 (MIN_VALUE wraps)", Intent.SAFE, new ConditionalDivisorTest.ByMinusOne(), new DataType[] { I }, I, false, false,
+                "java_idiv", c -> c.contains("java_idiv")));
+        cases.add(new Case("S29", "long floorDiv by -1", Intent.SAFE, new ConditionalDivisorTest.ByMinusOneLong(), new DataType[] { L }, L, false, false, null, null));
+        cases.add(new Case("S30", "LIST fold dividing by a conditional element divisor", Intent.SAFE, new ConditionalDivisorTest.ListCondDiv(), new DataType[] { listL }, L, false, false,
+                "zero test", guarded));
+        cases.add(new Case("S31", "LIST fold dividing by conditional non-zero constants", Intent.SAFE, new ConditionalDivisorTest.ListSafeDiv(), new DataType[] { listL }, L, false,
+                false, "precision: no zero test needed", c -> !zeroTest(c)));
     }
 }

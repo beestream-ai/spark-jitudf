@@ -143,19 +143,40 @@ final class LoweredOracle {
     /** {@code udf} as an executor runs it: after Java serialization, called reflectively. */
     static Object reference(Object udf, Object... args) {
         Object shipped = roundTrip(udf);
-        for (Method m : shipped.getClass().getMethods()) {
-            if (m.getName().equals("call") && !m.isBridge() && m.getParameterCount() == args.length) {
-                try {
-                    m.setAccessible(true);
-                    return normalise(m.invoke(shipped, args));
-                } catch (InvocationTargetException e) {
-                    return "threw:" + e.getCause().getClass().getSimpleName();
-                } catch (IllegalAccessException e) {
-                    throw new AssertionError(e);
-                }
-            }
+        // Through the interface Spark calls, so that virtual dispatch -- not a guess about which
+        // declared method is "the" call -- picks what runs. A class can declare several methods
+        // named call, and the one an interface call reaches can be inherited.
+        try {
+            Object result = switch (args.length) {
+                case 1 -> shipped instanceof org.apache.spark.sql.api.java.UDF1<?, ?> u ? call1(u, args[0])
+                        : ((scala.Function1<Object, Object>) shipped).apply(args[0]);
+                case 2 -> shipped instanceof org.apache.spark.sql.api.java.UDF2<?, ?, ?> u ? call2(u, args[0], args[1])
+                        : ((scala.Function2<Object, Object, Object>) shipped).apply(args[0], args[1]);
+                case 3 -> shipped instanceof org.apache.spark.sql.api.java.UDF3<?, ?, ?, ?> u ? call3(u, args[0], args[1], args[2])
+                        : ((scala.Function3<Object, Object, Object, Object>) shipped).apply(args[0], args[1], args[2]);
+                default -> throw new AssertionError("no reference call for arity " + args.length);
+            };
+            return normalise(result);
+        } catch (RuntimeException e) {
+            return "threw:" + e.getClass().getSimpleName();
+        } catch (Exception e) {
+            return "threw:" + e.getClass().getSimpleName();
         }
-        throw new AssertionError("no call method on " + shipped.getClass());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object call1(org.apache.spark.sql.api.java.UDF1<?, ?> u, Object a) throws Exception {
+        return ((org.apache.spark.sql.api.java.UDF1<Object, Object>) u).call(a);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object call2(org.apache.spark.sql.api.java.UDF2<?, ?, ?> u, Object a, Object b) throws Exception {
+        return ((org.apache.spark.sql.api.java.UDF2<Object, Object, Object>) u).call(a, b);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object call3(org.apache.spark.sql.api.java.UDF3<?, ?, ?, ?> u, Object a, Object b, Object c) throws Exception {
+        return ((org.apache.spark.sql.api.java.UDF3<Object, Object, Object, Object>) u).call(a, b, c);
     }
 
     private static Object normalise(Object value) {
