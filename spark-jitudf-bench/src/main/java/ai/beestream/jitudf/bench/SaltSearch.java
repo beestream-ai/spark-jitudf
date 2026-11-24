@@ -221,7 +221,8 @@ public final class SaltSearch {
             spark.udf().register("salt_bucket1", new BucketUdf1(), DataTypes.IntegerType);
 
             System.out.println("=== A/B salt search ===");
-            System.out.println("  master      : " + spark.sparkContext().master());
+            System.out.println("  master      : " + spark.sparkContext().master()
+                    + "  (defaultParallelism=" + spark.sparkContext().defaultParallelism() + ")");
             System.out.println("  correctness : " + smallUsers + " users x " + salts + " salts");
             System.out.println("  benchmark   : " + users + " users x " + salts + " salts = "
                     + (users * salts) + " assignments, " + runs + " measured runs each");
@@ -305,7 +306,11 @@ public final class SaltSearch {
     private static Dataset<Row> stats(SparkSession spark, long users, int salts, Variant variant) {
         // Built from &, * and + only. Spark's % and pmod are nullable, and one nullable column
         // would send the UDF down the null-aware path instead of the one being measured.
-        Dataset<Row> userTable = spark.range(0, users, 1, 8).selectExpr(
+        // Partitioned by the session's own parallelism, not a constant. A fixed 8 caps the heavy
+        // stage at eight tasks however many threads Spark was given, which would make a sweep over
+        // masters measure nothing but the constant.
+        int parts = Math.max(2, spark.sparkContext().defaultParallelism());
+        Dataset<Row> userTable = spark.range(0, users, 1, parts).selectExpr(
                 "id as user_id",
                 "(id * 2654435761) & 1023 as m1",
                 "(id * 40503) & 511 as m2");

@@ -73,10 +73,28 @@ public final class IntegrationTest {
         }
     }
 
+    /**
+     * The Spark master these programs run under.
+     *
+     * <p>
+     * It used to be the literal {@code local[2]}, which silently overrode whatever
+     * {@code spark-submit --master} was given. That is not a cosmetic bug: a benchmark whose CPU
+     * baseline is pinned to two threads on a 128-core machine reports a speedup that belongs to
+     * the thread count rather than to the GPU. The launcher passes the master it used in
+     * {@code app.expectMaster}, so that is what is honoured here, and {@code local[2]} remains the
+     * default so every existing suite runs exactly as before.
+     * </p>
+     */
+    static String requestedMaster() {
+        String fromLauncher = System.getProperty("app.expectMaster", "");
+        return fromLauncher.isEmpty() ? "local[2]" : fromLauncher;
+    }
+
     static SparkSession session(int rows) {
+        String requested = requestedMaster();
         SparkSession spark = SparkSession.builder() //
                 .appName("tornado-rapids-integration") //
-                .master("local[2]") //
+                .master(requested) //
                 .config("spark.plugins", "com.nvidia.spark.SQLPlugin") //
                 .config("spark.rapids.sql.enabled", "true") //
                 .config("spark.rapids.sql.udfCompiler.enabled", "true") //
@@ -90,6 +108,19 @@ public final class IntegrationTest {
                 .config("spark.sql.shuffle.partitions", "2") //
                 .getOrCreate();
         spark.sparkContext().setLogLevel("WARN");
+
+        // The same check movielens/Benchmark.java makes, for the same reason: a session that
+        // disagrees with the launcher must fail the run rather than be recorded under the wrong
+        // label. That guard existed and did not cover these programs, which is how a campaign of
+        // local[2] runs came to be reported as local[8].
+        String effective = spark.sparkContext().master();
+        if (!effective.equals(requested)) {
+            throw new IllegalStateException("Spark built a session on master " + effective
+                    + " but the launcher asked for " + requested
+                    + "; a measurement recorded under the wrong master is worse than no measurement");
+        }
+        System.out.println("  spark master: " + effective
+                + "  defaultParallelism=" + spark.sparkContext().defaultParallelism());
 
         spark.udf().register("tornado_loop", new LoopUdf(64), DataTypes.DoubleType);
         spark.udf().register("tornado_ddloop", new DataDependentLoopUdf(), DataTypes.DoubleType);
