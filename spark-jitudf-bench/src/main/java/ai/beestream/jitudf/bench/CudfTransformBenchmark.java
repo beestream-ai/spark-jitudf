@@ -186,6 +186,8 @@ public final class CudfTransformBenchmark {
         System.setProperty("tornado.spark.backend", TornadoUdfProvider.BACKEND_CUDF_TRANSFORM);
         SparkSession spark = IntegrationTest.session(1000);
         try {
+            System.out.println("  master = " + spark.sparkContext().master()
+                    + "  defaultParallelism = " + spark.sparkContext().defaultParallelism());
             spark.udf().register("b_collatz", new CollatzUdf(), DataTypes.IntegerType);
             spark.udf().register("b_bucket", new BucketUdf(), DataTypes.IntegerType);
             spark.udf().register("b_active", new ActiveDaysUdf(), DataTypes.IntegerType);
@@ -233,10 +235,8 @@ public final class CudfTransformBenchmark {
     private static void collatz(SparkSession spark, long rows, int warm) {
         System.out.println();
         System.out.println("=== W-collatz: sum(collatz(id+1)) over " + rows + " rows ===");
-        String query = "select sum(b_collatz(id + 1)) as total from range(0, " + rows + ", 1, 2)";
+        String query = "select sum(b_collatz(id + 1)) as total from range(0, " + rows + ", 1, " + parts(spark) + ")";
 
-        long cpu = time(spark, query, false, warm);
-        long gpu = time(spark, query, true, warm);
         long total = scalar(spark, query, true);
 
         if (rows == 50_000_000L) {
@@ -245,7 +245,7 @@ public final class CudfTransformBenchmark {
             check("collatz aggregate equals the published 8,600,532,084", total == 8_600_532_084L, "got " + total);
         }
         check("collatz: CPU and GPU agree", scalar(spark, query, false) == total, "cpu != gpu");
-        report("W-collatz", rows, cpu, gpu);
+        report3("W-collatz", "b_collatz", spark, query, rows, warm);
     }
 
     private static void bucketing(SparkSession spark, long rows, int warm) {
@@ -264,21 +264,17 @@ public final class CudfTransformBenchmark {
         check("bucket UDF matches Guava murmur3_32(0) bit for bit", mismatches == 0, mismatches + " mismatches");
 
         // One salt's worth of assignment; the 64-salt cross join of the original is not run here.
-        String query = "select sum(cast(b_bucket(id ^ 12345) < 500 as int)) as arm_a from range(0, " + rows + ", 1, 2)";
-        long cpu = time(spark, query, false, warm);
-        long gpu = time(spark, query, true, warm);
+        String query = "select sum(cast(b_bucket(id ^ 12345) < 500 as int)) as arm_a from range(0, " + rows + ", 1, " + parts(spark) + ")";
         check("bucket: CPU and GPU agree", scalar(spark, query, false) == scalar(spark, query, true), "cpu != gpu");
-        report("W-bucket", rows, cpu, gpu);
+        report3("W-bucket", "b_bucket", spark, query, rows, warm);
     }
 
     private static void bitmap(SparkSession spark, long rows, int warm) {
         System.out.println();
         System.out.println("=== W-bitmap: active days in a packed bitmap over " + rows + " rows ===");
-        String query = "select sum(b_active(id * 2654435761)) as active from range(0, " + rows + ", 1, 2)";
-        long cpu = time(spark, query, false, warm);
-        long gpu = time(spark, query, true, warm);
+        String query = "select sum(b_active(id * 2654435761)) as active from range(0, " + rows + ", 1, " + parts(spark) + ")";
         check("bitmap: CPU and GPU agree", scalar(spark, query, false) == scalar(spark, query, true), "cpu != gpu");
-        report("W-bitmap", rows, cpu, gpu);
+        report3("W-bitmap", "b_active", spark, query, rows, warm);
     }
 
     /**
@@ -298,7 +294,7 @@ public final class CudfTransformBenchmark {
         // bounds the total without changing what is being measured, and does so identically in
         // all three configurations.
         String query = "select sum(b_blend(id * 7 + 1, cast(id & 1023 as int)) & 1023) as total "
-                + "from range(0, " + rows + ", 1, 2)";
+                + "from range(0, " + rows + ", 1, " + parts(spark) + ")";
         check("blend: CPU and GPU agree", scalar(spark, query, false) == scalar(spark, query, true), "cpu != gpu");
         report3("W-blend", "b_blend", spark, query, rows, warm);
     }
@@ -317,7 +313,7 @@ public final class CudfTransformBenchmark {
         System.out.println("=== W-null-collatz: one row in eight null, over " + rows + " rows ===");
         String query = "select sum(b_null_collatz("
                 + "case when (id & 7) = 0 then null else id + 1 end)) as total "
-                + "from range(0, " + rows + ", 1, 2)";
+                + "from range(0, " + rows + ", 1, " + parts(spark) + ")";
         check("null collatz: CPU and GPU agree, including the null rows",
                 scalar(spark, query, false) == scalar(spark, query, true), "cpu != gpu");
         report3("W-null-collatz", "b_null_collatz", spark, query, rows, warm);
@@ -364,6 +360,20 @@ public final class CudfTransformBenchmark {
         Mode(String label) {
             this.label = label;
         }
+    }
+
+    /**
+     * How many partitions the source range gets.
+     *
+     * <p>
+     * Not a constant. Every query here used a hard-coded 2, which caps the heavy stage at two
+     * tasks however many threads Spark is given -- so a sweep over masters would have measured the
+     * constant rather than the configuration. The same mistake, in the same shape, as the
+     * hard-coded master these numbers were first reported under.
+     * </p>
+     */
+    private static int parts(SparkSession spark) {
+        return Math.max(2, spark.sparkContext().defaultParallelism());
     }
 
     private static long time(SparkSession spark, String query, boolean gpu, int warm) {
