@@ -107,6 +107,11 @@ public enum PrimitiveKind {
         return boxedClass;
     }
 
+    /** The internal name of the box, e.g. {@code java/lang/Long}, as a {@code checkcast} names it. */
+    public String boxInternalName() {
+        return boxedClass.getName().replace('.', '/');
+    }
+
 
 
     /** The JVM field descriptor of the primitive, e.g. {@code D} for a double. */

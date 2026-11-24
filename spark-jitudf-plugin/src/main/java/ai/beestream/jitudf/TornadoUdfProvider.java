@@ -52,7 +52,20 @@ public final class TornadoUdfProvider {
         TORNADOVM_DISABLED
     }
 
-    private static final ConcurrentHashMap<String, String> DECISIONS = new ConcurrentHashMap<>();
+    /**
+     * The most recent decision per UDF name, bounded: a long-lived driver planning many distinct
+     * UDFs must not grow this without end. The oldest entry goes first.
+     */
+    private static final int MAX_DECISIONS = 1024;
+
+    private static final java.util.Map<String, String> DECISIONS = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(16, 0.75f, false) {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected boolean removeEldestEntry(java.util.Map.Entry<String, String> eldest) {
+            return size() > MAX_DECISIONS;
+        }
+    });
     private static final AtomicLong ACCEPTED = new AtomicLong();
     private static final AtomicLong REFUSED = new AtomicLong();
 
@@ -99,6 +112,11 @@ public final class TornadoUdfProvider {
             // own final fields, which is state, and state is what a kernel does not have. Folding
             // those reads into the values the instance holds makes it an ordinary UDF, and does so
             // early enough that the analysis, the lowering and the cache key all see folded code.
+            // The object executors run is the one Spark's serialization produces, not the driver's.
+            String shipping = ConstantFieldFolding.executorViewProblem(found.instance());
+            if (shipping != null) {
+                return refuse(name, shipping);
+            }
             ResolvedUdf resolved = ConstantFieldFolding.fold(found);
 
             ResolvedUdf resolvedUdf = resolved;
@@ -229,7 +247,7 @@ public final class TornadoUdfProvider {
         if (eligibility.inputs().isEmpty()) {
             return refuse(name, "cudf::transform needs at least one input column, and this UDF takes none");
         }
-        String semantics = SparkSemantics.refusalFor(eligibility.outputKind(), eligibility.inputs());
+        String semantics = SparkSemantics.refusalFor(eligibility.outputKind(), eligibility.inputs(), eligibility.usesFloatingPoint());
         if (semantics != null) {
             return refuse(name, semantics);
         }
@@ -286,7 +304,7 @@ public final class TornadoUdfProvider {
      */
     private static Object listReductionUdf(String name, ResolvedUdf resolved, EligibilityResult eligibility, String cacheKey) {
         InputSpec list = eligibility.inputs().get(0);
-        String semantics = SparkSemantics.refusalFor(eligibility.outputKind(), eligibility.inputs());
+        String semantics = SparkSemantics.refusalFor(eligibility.outputKind(), eligibility.inputs(), eligibility.usesFloatingPoint());
         if (semantics != null) {
             return refuse(name, semantics);
         }
@@ -298,7 +316,17 @@ public final class TornadoUdfProvider {
         }
         var split = ListReductionSplit.split(body, list.kind(), eligibility.outputKind());
         if (split.isEmpty()) {
-            return refuse(name, "this UDF reads a list but is not a sum over its elements, and cudf::transform cannot take a list column directly");
+            return refuse(name, "this UDF reads a list but is not provably a sum over every element (" + ListReductionSplit.lastReason()
+                    + "), and cudf::transform cannot take a list column directly");
+        }
+        if (eligibility.outputKind() == PrimitiveKind.FLOAT || eligibility.outputKind() == PrimitiveKind.DOUBLE) {
+            // A segmented sum adds in a different order from the Java loop, and floating-point
+            // addition is not associative: with cancellation the difference is not an ulp but can be
+            // the whole answer. RAPIDS has its own switch for exactly this, for its own float sums.
+            String order = SparkSemantics.refusalForReorderedFloatSum();
+            if (order != null) {
+                return refuse(name, order);
+            }
         }
 
         CudfDeviceFunctionGenerator.Generated generated;
@@ -307,14 +335,17 @@ public final class TornadoUdfProvider {
         } catch (RuntimeException e) {
             return refuse(name, "the element function could not be generated: " + e);
         }
-        TcCudaCompiler.Result compiled = TcCudaCompiler.compile(generated, java.util.List.of(InputSpec.scalar(list.kind())), resolved.declaringClass().getClassLoader());
+        // The element function can divide like any other: with a divisor that may be zero it must be
+        // compiled with the error channel, exactly as the scalar path is, or a zero becomes a number.
+        TcCudaCompiler.Result compiled = TcCudaCompiler.compile(generated, java.util.List.of(InputSpec.scalar(list.kind())), resolved.declaringClass().getClassLoader(),
+                eligibility.reportsArithmeticErrors());
         if (!compiled.ok()) {
             return refuse(name, compiled.refusal());
         }
 
         DECISIONS.put(name, Decision.TORNADOVM_ELIGIBLE + " (cudf-transform, list reduction): " + eligibility.inputs() + " -> " + eligibility.outputKind());
         ACCEPTED.incrementAndGet();
-        return new CudfListReductionUdf(compiled.source(), name, eligibility.outputKind());
+        return new CudfListReductionUdf(compiled.source(), name, eligibility.outputKind(), eligibility.reportsArithmeticErrors());
     }
 
     private static org.objectweb.asm.tree.MethodNode userMethodOf(ResolvedUdf resolved) {
@@ -371,7 +402,9 @@ public final class TornadoUdfProvider {
 
     /** The decision taken for each UDF seen in this JVM, for explain output and the report. */
     public static java.util.Map<String, String> decisions() {
-        return java.util.Map.copyOf(DECISIONS);
+        synchronized (DECISIONS) {
+            return java.util.Map.copyOf(DECISIONS);
+        }
     }
 
     public static long accepted() {

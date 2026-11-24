@@ -49,6 +49,20 @@ public final class SparkSemantics {
      *         what the UDF returns; floating point is the case that needs the opt-in.
      */
     public static String refusalFor(PrimitiveKind outputKind, java.util.List<InputSpec> inputs) {
+        return refusalFor(outputKind, inputs, false);
+    }
+
+    /**
+     * As above, given whether the reachable computation itself performs floating-point operations.
+     *
+     * <p>
+     * The signature is not enough: {@code (int) (Math.sin(x) * 1e9)} takes and returns integers and
+     * still computes a device {@code sin}, whose result -- and therefore the truncated integer --
+     * can differ from the CPU's. {@link ComputationEffects} finds that in the bytecode, including
+     * inside JDK bodies TC inlines, and the analysis passes it here.
+     * </p>
+     */
+    public static String refusalFor(PrimitiveKind outputKind, java.util.List<InputSpec> inputs, boolean computationUsesFloatingPoint) {
         // ANSI mode is deliberately not consulted here, and it took a failing test to see why.
         //
         // Spark 4.0 turns `spark.sql.ansi.enabled` on by default, so a gate on it would refuse every
@@ -60,7 +74,7 @@ public final class SparkSemantics {
         //
         // The divergence that does exist is Java's, not ANSI's, and it is handled where the bytecode
         // is visible: see the integer-division check in TornadoUdfProvider.
-        if (usesFloatingPoint(outputKind, inputs) && !incompatibleOpsEnabled()) {
+        if ((computationUsesFloatingPoint || usesFloatingPoint(outputKind, inputs)) && !incompatibleOpsEnabled()) {
             // Not a precision complaint: TornadoVM's CUDA backend contracts a*b+c into fma, which
             // Java forbids, so results can differ from the CPU in the last ulp. More accurate is
             // still different, and RAPIDS gates differences behind this flag rather than judging
@@ -80,6 +94,35 @@ public final class SparkSemantics {
             }
         }
         return false;
+    }
+
+    /** RAPIDS's own switch for floating-point aggregations whose result depends on evaluation order. */
+    public static final String VARIABLE_FLOAT_AGG = "spark.rapids.sql.variableFloatAgg.enabled";
+
+    /**
+     * Why a floating-point fold must not become a segmented sum, or null.
+     *
+     * <p>
+     * The loop adds left to right; the segmented sum adds in whatever order the device does.
+     * RAPIDS gates its own order-dependent float aggregations on {@value #VARIABLE_FLOAT_AGG}
+     * (default true), and the incompatible-ops switch covers the device arithmetic itself, so both
+     * must allow it. Integer folds are unaffected: wrapping addition is associative.
+     * </p>
+     */
+    public static String refusalForReorderedFloatSum() {
+        if (!incompatibleOpsEnabled()) {
+            return "this list fold sums floating point, whose GPU result can differ from Spark's; set " + INCOMPATIBLE_OPS + "=true to allow it";
+        }
+        boolean variable;
+        try {
+            variable = Boolean.parseBoolean(SQLConf.get().getConfString(VARIABLE_FLOAT_AGG, "true"));
+        } catch (Throwable t) {
+            variable = true;
+        }
+        if (!variable) {
+            return "this list fold sums floating point in a different order from the Java loop, and " + VARIABLE_FLOAT_AGG + " is false";
+        }
+        return null;
     }
 
     static boolean ansiEnabled() {

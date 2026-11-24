@@ -258,17 +258,21 @@ public final class UdfEligibilityAnalyzer {
         }
 
         boolean[] needsErrorReporting = { false };
-        String problem = walkReachableMethods(udf, inputs, canReportArithmeticErrors, needsErrorReporting, nullAware);
+        boolean[] usesFloatingPoint = { false };
+        String problem = walkReachableMethods(udf, inputs, canReportArithmeticErrors, needsErrorReporting, nullAware, usesFloatingPoint);
         if (problem != null) {
             return EligibilityResult.ineligible(problem);
         }
+        // The signature counts too: a float column read and ignored still has to be decoded.
+        boolean floatingPoint = usesFloatingPoint[0] || SparkSemantics.usesFloatingPoint(outputKind, inputs);
         if (nullAware) {
             // The compilation itself is the remaining gate. TC refuses a null-aware method that does
             // something it cannot give a null meaning to -- comparing two boxes with equals, for
             // instance -- and that refusal arrives at planning time, as a CPU fallback.
-            return EligibilityResult.eligibleNullAware(udf, inputs, outputKind, needsErrorReporting[0]);
+            return EligibilityResult.eligibleNullAware(udf, inputs, outputKind, needsErrorReporting[0]).withFloatingPoint(floatingPoint);
         }
-        return needsErrorReporting[0] ? EligibilityResult.eligibleWithArithmeticErrors(udf, inputs, outputKind) : EligibilityResult.eligible(udf, inputs, outputKind);
+        return (needsErrorReporting[0] ? EligibilityResult.eligibleWithArithmeticErrors(udf, inputs, outputKind) : EligibilityResult.eligible(udf, inputs, outputKind))
+                .withFloatingPoint(floatingPoint);
     }
 
     /**
@@ -300,7 +304,8 @@ public final class UdfEligibilityAnalyzer {
     }
 
     /** Walks every method the UDF can reach inside its own class; returns the first problem or null. */
-    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs, boolean canReportArithmeticErrors, boolean[] needsErrorReporting, boolean nullAware) {
+    private static String walkReachableMethods(ResolvedUdf udf, List<InputSpec> inputs, boolean canReportArithmeticErrors, boolean[] needsErrorReporting, boolean nullAware,
+            boolean[] usesFloatingPoint) {
         ClassNode classNode = new ClassNode();
         new ClassReader(udf.classFile()).accept(classNode, ClassReader.SKIP_FRAMES);
         String owner = classNode.name;
@@ -336,8 +341,10 @@ public final class UdfEligibilityAnalyzer {
                 }
             }
             Set<Integer> referenceSlots = isEntry ? parameterSlots(method, inputs) : Set.of();
+            ArrayParameters arrays = isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none();
             String problem = checkInstructions(method, classNode, pending, seen, key, callGraph, referenceSlots,
-                    isEntry ? ArrayParameters.of(method, inputs) : ArrayParameters.none(), canReportArithmeticErrors, needsErrorReporting, nullAware && isEntry);
+                    arrays, canReportArithmeticErrors, needsErrorReporting, nullAware && isEntry, CastProof.of(owner, method, arrays, isEntry ? inputs : null),
+                    usesFloatingPoint);
             if (problem != null) {
                 return problem;
             }
@@ -476,7 +483,7 @@ public final class UdfEligibilityAnalyzer {
 
     private static String checkInstructions(MethodNode method, ClassNode classNode, Deque<String> pending, Set<String> seen, String self,
             Map<String, Set<String>> callGraph, Set<Integer> referenceSlots, ArrayParameters arrays, boolean canReportArithmeticErrors, boolean[] needsErrorReporting,
-            boolean nullAware) {
+            boolean nullAware, CastProof casts, boolean[] usesFloatingPoint) {
         String arrayProblem = arrays.check(method);
         if (arrayProblem != null) {
             return arrayProblem;
@@ -488,6 +495,9 @@ public final class UdfEligibilityAnalyzer {
             int op = insn.getOpcode();
             if (op < 0) {
                 continue; // labels, line numbers, frames
+            }
+            if (ComputationEffects.isFloatingPoint(insn)) {
+                usesFloatingPoint[0] = true;
             }
             if (ALLOWED_OPCODES.contains(op)) {
                 String divisionProblem = checkDivision(insn, i > 0 ? instructions[i - 1] : null, op, canReportArithmeticErrors, needsErrorReporting);
@@ -553,8 +563,20 @@ public final class UdfEligibilityAnalyzer {
                     }
                 }
                 case Opcodes.INSTANCEOF, Opcodes.CHECKCAST -> {
-                    if (insn instanceof org.objectweb.asm.tree.TypeInsnNode type && !isSupportedBox(type.desc)) {
+                    org.objectweb.asm.tree.TypeInsnNode type = (org.objectweb.asm.tree.TypeInsnNode) insn;
+                    if (!isSupportedBox(type.desc)) {
                         return "the UDF casts to or tests " + type.desc.replace('/', '.') + ", which is not a supported numeric type";
+                    }
+                    if (op == Opcodes.INSTANCEOF && nullAware) {
+                        // Over a nullable column `x instanceof Integer` is `x != null`, which the
+                        // null-aware compilation would have to express; it is not established that it does.
+                        return "the UDF tests instanceof over a nullable column, which this compiler does not lower";
+                    }
+                    // Lowering erases the cast (or folds the test), which is only right when it
+                    // cannot fail: the value must provably already be that box.
+                    String castProblem = casts.whyUnproven(type);
+                    if (castProblem != null) {
+                        return castProblem;
                     }
                 }
                 case Opcodes.GETFIELD, Opcodes.PUTFIELD, Opcodes.GETSTATIC, Opcodes.PUTSTATIC -> {
@@ -574,9 +596,65 @@ public final class UdfEligibilityAnalyzer {
                     if (callProblem != null) {
                         return callProblem;
                     }
+                    if (call.owner.startsWith("java/") && !BoxConversions.isKnown(call)) {
+                        // TC compiles this call by inlining (or intrinsifying) the JDK's own body, so
+                        // what that body can do is part of what this UDF does.
+                        String effectProblem = checkJdkCallEffects(call, i > 0 ? previousReal(instructions, i) : null, canReportArithmeticErrors, needsErrorReporting,
+                                usesFloatingPoint);
+                        if (effectProblem != null) {
+                            return effectProblem;
+                        }
+                    }
                 }
                 default ->
                     { return "the UDF uses bytecode " + op + ", which is not in the set this compiler knows how to carry into a kernel"; }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Applies the effects of an admitted JDK call, found in its own bytecode (see
+     * {@link ComputationEffects}): a division anywhere in its body is treated as one written in the
+     * UDF, and floating point anywhere in it makes the UDF floating point.
+     *
+     * <p>
+     * {@code Math.floorDiv} and {@code Math.floorMod} get one refinement, because they are what a
+     * bucketing UDF is made of and their contract is narrow: they throw exactly when the divisor --
+     * their last argument -- is zero. A non-zero constant there means they cannot throw, as
+     * {@code x % 1000} cannot, and no error channel is needed.
+     * </p>
+     */
+    private static String checkJdkCallEffects(MethodInsnNode call, AbstractInsnNode previous, boolean canReportArithmeticErrors, boolean[] needsErrorReporting,
+            boolean[] usesFloatingPoint) {
+        ComputationEffects.Effects effects = ComputationEffects.ofJdkCall(call);
+        if (effects.usesFloatingPoint()) {
+            usesFloatingPoint[0] = true;
+        }
+        if (!effects.mayDivideByZero()) {
+            return null;
+        }
+        boolean floorFamily = call.owner.equals("java/lang/Math") || call.owner.equals("java/lang/StrictMath");
+        floorFamily &= call.name.equals("floorDiv") || call.name.equals("floorMod");
+        if (floorFamily) {
+            Long divisor = constantOf(previous);
+            if (divisor != null && divisor != 0) {
+                return null;
+            }
+        }
+        if (canReportArithmeticErrors) {
+            needsErrorReporting[0] = true;
+            return null;
+        }
+        return "the UDF calls " + call.owner.replace('/', '.') + "." + call.name + ", whose JDK body divides by a value this analysis cannot prove non-zero; "
+                + "Java would raise ArithmeticException and this backend cannot";
+    }
+
+    /** The instruction before index {@code i} that is a real opcode, or null. */
+    private static AbstractInsnNode previousReal(AbstractInsnNode[] instructions, int i) {
+        for (int j = i - 1; j >= 0; j--) {
+            if (instructions[j].getOpcode() >= 0) {
+                return instructions[j];
             }
         }
         return null;

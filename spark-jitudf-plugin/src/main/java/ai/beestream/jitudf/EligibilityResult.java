@@ -27,6 +27,7 @@ public final class EligibilityResult {
     private final ResolvedUdf udf;
     private final boolean reportsArithmeticErrors;
     private final boolean nullAware;
+    private final boolean usesFloatingPoint;
 
     private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf) {
         this(eligible, reason, inputs, outputKind, udf, false, false);
@@ -37,6 +38,12 @@ public final class EligibilityResult {
     }
 
     private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf, boolean reportsArithmeticErrors, boolean nullAware) {
+        this(eligible, reason, inputs, outputKind, udf, reportsArithmeticErrors, nullAware, false);
+    }
+
+    private EligibilityResult(boolean eligible, String reason, List<InputSpec> inputs, PrimitiveKind outputKind, ResolvedUdf udf, boolean reportsArithmeticErrors, boolean nullAware,
+            boolean usesFloatingPoint) {
+        this.usesFloatingPoint = usesFloatingPoint;
         this.reportsArithmeticErrors = reportsArithmeticErrors;
         this.nullAware = nullAware;
         this.eligible = eligible;
@@ -77,6 +84,19 @@ public final class EligibilityResult {
     /** Whether the device function takes and returns {@code cuda::std::optional}s. */
     public boolean isNullAware() {
         return nullAware;
+    }
+
+    /**
+     * Whether the reachable computation performs any floating-point operation -- in the UDF, its
+     * helpers, or a JDK body TC inlines -- whatever its signature says. See {@link ComputationEffects}.
+     */
+    public boolean usesFloatingPoint() {
+        return usesFloatingPoint;
+    }
+
+    /** This result, recording whether the reachable computation uses floating point. */
+    EligibilityResult withFloatingPoint(boolean value) {
+        return new EligibilityResult(eligible, reason, inputs, outputKind, udf, reportsArithmeticErrors, nullAware, value);
     }
 
     public static EligibilityResult ineligible(String reason) {

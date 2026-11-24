@@ -46,8 +46,10 @@ final class KernelIdentity {
     /**
      * Bumped whenever the lowering or the generator changes what it emits for the same input, so
      * that kernels cached by an older version of this code are never reused by a newer one.
+     * 3: casts proven before erasure, instanceof folded, fields folded from the serialized copy,
+     * JDK-body effects deciding error reporting.
      */
-    private static final String LOWERING_VERSION = "2";
+    private static final String LOWERING_VERSION = "3";
 
     private KernelIdentity() {
     }

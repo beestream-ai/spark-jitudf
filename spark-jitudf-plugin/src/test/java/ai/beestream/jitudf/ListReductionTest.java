@@ -97,35 +97,20 @@ class ListReductionTest {
         // acc += arr[i] * i is not a fold over independent elements, so no element function exists.
         assertNull(compile(new PositionalUdf(), "positional"));
         String decision = TornadoUdfProvider.decisions().get("positional");
-        assertTrue(decision != null && decision.contains("not a sum over its elements"), () -> "reason was: " + decision);
+        assertTrue(decision != null && decision.contains("not provably a sum over every element") && decision.contains("loop index"), () -> "reason was: " + decision);
     }
 
     @Test
     void theExtractedElementFunctionComputesWhatTheLoopBodyDid() throws Exception {
-        // Run the extracted element function on the CPU and compare with the original UDF, so that
-        // "the split is correct" is checked rather than assumed.
-        ResolvedUdf resolved = ConstantFieldFolding.fold(UdfResolver.resolve(new ActiveDaysUdf()).orElseThrow());
-        List<InputSpec> inputs = List.of(InputSpec.list(PrimitiveKind.LONG));
-        EligibilityResult eligibility = UdfEligibilityAnalyzer.analyse(resolved,
-                List.of(DataTypes.createArrayType(DataTypes.LongType, false)), DataTypes.IntegerType, false, true);
-        assertTrue(eligibility.isEligible(), eligibility::reason);
-
-        org.objectweb.asm.tree.ClassNode node = new org.objectweb.asm.tree.ClassNode();
-        new org.objectweb.asm.ClassReader(resolved.classFile()).accept(node, org.objectweb.asm.ClassReader.SKIP_FRAMES);
-        org.objectweb.asm.tree.MethodNode user = node.methods.stream()
-                .filter(m -> m.name.equals("call") && m.desc.equals(org.objectweb.asm.Type.getMethodDescriptor(resolved.method())))
-                .findFirst().orElseThrow();
-        org.objectweb.asm.tree.MethodNode body = AsmUdfLowering.lower(user, "udfBody", inputs, PrimitiveKind.INT, false);
-        var split = ListReductionSplit.split(body, PrimitiveKind.LONG, PrimitiveKind.INT);
-        assertTrue(split.isPresent(), "the fold should split");
-
-        // The element function here is `(int) x`; summing it must equal the original UDF.
-        long[] row = { 0b1011L, 0xffL, 1L, 0L };
-        int expected = new ActiveDaysUdf().call(row);
-        int sum = 0;
-        for (long v : row) {
-            sum += Long.bitCount(v);
+        // Executes the element function the split really extracted, over every element of each row,
+        // summed as the executor's segmented reduction does -- and compares with the UDF itself.
+        // (This used to compare the UDF with a second hand-written popcount loop, which tested
+        // nothing the split produced.)
+        java.lang.reflect.Method element = LoweredOracle.elementFunction(new ActiveDaysUdf(),
+                DataTypes.createArrayType(DataTypes.LongType, false), DataTypes.IntegerType);
+        long[][] rows = { {}, { 0b1011L, 0xffL, 1L, 0L }, { -1L }, { Long.MIN_VALUE, Long.MAX_VALUE } };
+        for (long[] row : rows) {
+            assertEquals(new ActiveDaysUdf().call(row), LoweredOracle.reduceRow(element, PrimitiveKind.INT, row), java.util.Arrays.toString(row));
         }
-        assertEquals(expected, sum, "the reduction of the element function must equal the UDF");
     }
 }

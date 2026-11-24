@@ -132,7 +132,7 @@ final class ListBoundsProof {
             if (inBounds >= instructions.length || !dominates(inBounds, at)) {
                 continue;
             }
-            String counterProblem = checkCounterDiscipline(indexSlot, at);
+            String counterProblem = checkCounterDiscipline(indexSlot, at, g);
             if (counterProblem != null) {
                 return counterProblem;
             }
@@ -228,7 +228,7 @@ final class ListBoundsProof {
      * The loop variable must start non-negative and only ever move up, after the access. Otherwise
      * the value the comparison accepted is not the value the access uses.
      */
-    private String checkCounterDiscipline(int indexSlot, int accessAt) {
+    private String checkCounterDiscipline(int indexSlot, int accessAt, int guardAt) {
         for (AbstractInsnNode write : writesTo(indexSlot)) {
             Integer writeAt = indexOf.get(write);
             if (writeAt == null) {
@@ -238,7 +238,7 @@ final class ListBoundsProof {
                 if (increment.incr <= 0) {
                     return "the loop variable can decrease, so a checked index does not stay checked";
                 }
-                if (!dominates(accessAt, writeAt)) {
+                if (reachesWithoutRecheck(guardAt + 1, writeAt, guardAt) && reachesWithoutRecheck(writeAt, accessAt, guardAt)) {
                     return "the loop variable is advanced on a path that reaches the access, so the checked value is not the one used";
                 }
                 continue;
@@ -399,6 +399,37 @@ final class ListBoundsProof {
             }
         }
         return a;
+    }
+
+    /**
+     * Whether {@code to} is reachable from {@code from} along a path that does not pass through the
+     * bounds check at {@code guard}. An increment between the check and an access on such a path
+     * means the access can use a value the check never saw; an increment that is only reached after
+     * the access, or only on the way back to the check, does not. This is the precise condition --
+     * the access need not dominate the increment, which a read on one arm of a branch never does.
+     */
+    private boolean reachesWithoutRecheck(int from, int to, int guard) {
+        if (from == to) {
+            return true;
+        }
+        boolean[] visited = new boolean[instructions.length];
+        java.util.ArrayDeque<Integer> work = new java.util.ArrayDeque<>();
+        work.add(from);
+        visited[from] = true;
+        while (!work.isEmpty()) {
+            int node = work.poll();
+            for (int next : successors.get(node)) {
+                if (next == to) {
+                    return true;
+                }
+                if (next == guard || visited[next]) {
+                    continue;
+                }
+                visited[next] = true;
+                work.add(next);
+            }
+        }
+        return false;
     }
 
     /** Whether every path from the method's entry to {@code target} passes through {@code source}. */

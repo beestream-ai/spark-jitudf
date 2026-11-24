@@ -21,6 +21,7 @@ import ai.rapids.cudf.ColumnVector;
 import ai.rapids.cudf.ColumnView;
 import ai.rapids.cudf.DType;
 import ai.rapids.cudf.OutputNullability;
+import ai.rapids.cudf.Scalar;
 import ai.rapids.cudf.SegmentedReductionAggregation;
 
 import com.nvidia.spark.RapidsUDF;
@@ -67,11 +68,31 @@ public final class CudfListReductionUdf implements RapidsUDF, Serializable {
     private final String elementCuda;
     private final String udfName;
     private final PrimitiveKind resultKind;
+    private final boolean reportsArithmeticErrors;
 
     public CudfListReductionUdf(String elementCuda, String udfName, PrimitiveKind resultKind) {
+        this(elementCuda, udfName, resultKind, false);
+    }
+
+    public CudfListReductionUdf(String elementCuda, String udfName, PrimitiveKind resultKind, boolean reportsArithmeticErrors) {
         this.elementCuda = elementCuda;
         this.udfName = udfName;
         this.resultKind = resultKind;
+        this.reportsArithmeticErrors = reportsArithmeticErrors;
+    }
+
+    /** Whether the element function returns a cudf error code (a divisor that may be zero). */
+    public boolean reportsArithmeticErrors() {
+        return reportsArithmeticErrors;
+    }
+
+    /** Thrown for a null list row: the Java fold dereferences its argument unconditionally. */
+    public static final class NullListException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        NullListException(String message) {
+            super(message);
+        }
     }
 
     public String cudaSource() {
@@ -87,18 +108,40 @@ public final class CudfListReductionUdf implements RapidsUDF, Serializable {
         if (!DType.LIST.equals(list.getType())) {
             throw new IllegalStateException(udfName + " expected a LIST column but got " + list.getType());
         }
-        // The child is borrowed from the caller's column; the transformed child and the rebuilt view
-        // are ours and are closed here. The reduction's result is what this method returns, so it is
-        // the one thing not closed.
+        // A null row is a null argument. Spark passes it to the Java method, whose canonical fold
+        // reads `arr.length` first and throws NullPointerException -- the task fails. The segmented
+        // sum would instead return null for the row and carry on, which is a different answer. So a
+        // batch holding a null list fails the same way the CPU plan would, before any work is done;
+        // a nullable column with no nulls in it runs normally.
+        if (list.getNullCount() > 0) {
+            throw new NullListException(udfName + ": a null list reached a UDF that dereferences its list argument; "
+                    + "the Java UDF raises NullPointerException for it, so the query fails rather than returning null");
+        }
+        // The child is borrowed from the caller's column; the transformed child, the rebuilt view and
+        // the raw sums are ours and are closed here. The filled sums are what this method returns.
         try (ColumnView child = list.getChildColumnView(0)) {
             // The generalized binding, so that the element function may produce something other than
             // INT32: listReduce is then asked for the same type, and the sum stays in it.
-            try (ColumnVector mapped = ColumnView.transform(new ColumnView[] { child }, elementCuda, false, resultKind.cudfType(), false, OutputNullability.PRESERVE)) {
-                try (ColumnView rebuilt = list.replaceChildrenWithViews(new int[] { 0 }, new ColumnView[] { mapped })) {
-                    return rebuilt.listReduce(SegmentedReductionAggregation.sum(), resultKind.cudfType());
-                }
+            try (ColumnVector mapped = ColumnView.transform(new ColumnView[] { child }, elementCuda, false, resultKind.cudfType(), false, OutputNullability.PRESERVE);
+                    ColumnView rebuilt = list.replaceChildrenWithViews(new int[] { 0 }, new ColumnView[] { mapped });
+                    ColumnVector sums = rebuilt.listReduce(SegmentedReductionAggregation.sum(), resultKind.cudfType());
+                    Scalar zero = zeroOf(resultKind)) {
+                // libcudf's segmented sum has no initial value and returns null for an empty segment.
+                // The Java fold starts at zero, so a valid empty list is 0, not null. Every row is
+                // valid here (null rows were refused above), so every null in `sums` is an empty list.
+                return sums.replaceNulls(zero);
             }
         }
+    }
+
+    private static Scalar zeroOf(PrimitiveKind kind) {
+        return switch (kind) {
+            case INT -> Scalar.fromInt(0);
+            case LONG -> Scalar.fromLong(0L);
+            case FLOAT -> Scalar.fromFloat(0f);
+            case DOUBLE -> Scalar.fromDouble(0d);
+            case BOOL -> throw new IllegalStateException("a list reduction cannot sum booleans");
+        };
     }
 
     @Override

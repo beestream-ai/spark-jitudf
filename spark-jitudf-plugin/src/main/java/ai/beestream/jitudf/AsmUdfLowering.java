@@ -202,7 +202,18 @@ final class AsmUdfLowering {
                 if (!isBox(cast.desc)) {
                     throw new IllegalStateException("unexpected checkcast to " + cast.desc + " in a method the analysis accepted");
                 }
-                // The value is already the primitive.
+                // The value is already the primitive. Erasing the cast is only sound because CastProof
+                // has shown, at this instruction, that the value is exactly this box at run time.
+            }
+            case Opcodes.INSTANCEOF -> {
+                TypeInsnNode test = (TypeInsnNode) insn;
+                if (!isBox(test.desc)) {
+                    throw new IllegalStateException("unexpected instanceof " + test.desc + " in a method the analysis accepted");
+                }
+                // CastProof established that the value is exactly this box, and over a non-null
+                // column it is present, so the test is true.
+                out.add(new InsnNode(Opcodes.POP));
+                out.add(new InsnNode(Opcodes.ICONST_1));
             }
             case Opcodes.ARRAYLENGTH -> {
                 ParameterSlots slots = slotsFor(parameters, arrays, insn);
