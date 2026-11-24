@@ -27,6 +27,7 @@ public class ColumnView {
   static native long bitwise_op(long a, long b);
   static native long concat(long a);
   static native long concat(long a, long b);
+  static native long cuFileCreate();
 }
 JAVA
 printf 'package ai.rapids.cudf;\npublic enum OutputNullability { PRESERVE, ALL_VALID }\n' > "$WORK/java-new/ai/rapids/cudf/OutputNullability.java"
@@ -37,6 +38,7 @@ public class ColumnView {
   static native long bitwise_op(long a, long b);
   static native long concat(long a);
   static native long concat(long a, long b);
+  static native long cuFileCreate();
 }
 JAVA
 javac -d "$WORK/classes-new" "$WORK"/java-new/ai/rapids/cudf/*.java
@@ -72,6 +74,9 @@ void Java_ai_rapids_cudf_ColumnView_transformMulti(void) {}
 const char toolkit[] = "Cuda compilation tools, release 12.9, V0";' > "$WORK/short-overload.c"
 cc -shared -fPIC -O0 -o "$WORK/short-overload.so" "$WORK/short-overload.c"
 cc -shared -fPIC -O0 -o "$WORK/jnistub.so" -x c - <<< 'void jni_stub(void) {}'
+
+# A distribution whose cuFileCreate does link, for the case where the swap would lose it.
+lib old-with-cufile 12.9 'void Java_ai_rapids_cudf_ColumnView_cuFileCreate(void) {}'
 
 # make_jar <out> <arch-dir> <libcudf.so> <classes-dir> <revision> <manifest> [extra-lib]
 make_jar() {
@@ -116,7 +121,8 @@ echo "--- a matching JNI artifact with every native method exported"
 make_jar "$WORK/jni.jar" "$ARCH" "$WORK/exported.so" "$WORK/classes-new" r1 jni
 run "$WORK/jni.jar" "$WORK/dist.jar" "$WORK/out.jar"
 check "succeeds" "[ $? = 0 ]"
-check "reports every native method linked" "grep -q 'all 5 native methods resolve' $WORK/log"
+check "reports the native methods linked" "grep -q '5 of 6 native methods resolve' $WORK/log"
+check "reports, without refusing, the one that links in neither (cuFileCreate)" "grep -q '1 native method(s) link in neither' $WORK/log"
 check "the output exists, with provenance" "[ -f $WORK/out.jar ] && [ -f $WORK/out.jar.provenance ]"
 check "no .part is left" "[ ! -e $WORK/out.jar.part ]"
 check "the distribution's manifest is kept" "[ \"\$(unzip -p $WORK/out.jar META-INF/MANIFEST.MF)\" = dist ]"
@@ -187,6 +193,22 @@ refused "$WORK/jni-r2.jar" "is not the distribution's" "mismatched version metad
 echo "--- a different set of native libraries (a stale one would stay behind)"
 make_jar "$WORK/jni-extra.jar" "$ARCH" "$WORK/exported.so" "$WORK/classes-new" r1 jni libextra.so
 refused "$WORK/jni-extra.jar" "native libraries differ" "extra library"
+
+echo "--- a native that links in the distribution but would not after the swap"
+make_jar "$WORK/dist-cufile.jar" "$ARCH" "$WORK/old-with-cufile.so" "$WORK/classes-old" r1 dist
+out=$WORK/out-cufile.jar
+run "$WORK/jni.jar" "$WORK/dist-cufile.jar" "$out"
+check "is refused, naming it" "[ $? != 0 ] && [ ! -e $out ] && grep -q 'cuFileCreate' $WORK/log && grep -q 'linked in the distribution' $WORK/log"
+
+echo "--- ALLOW_CUDA_MAJOR_MISMATCH lets a whole-set replacement through, and records it"
+out=$WORK/out-cuda13-allowed.jar
+ALLOW_CUDA_MAJOR_MISMATCH=1 run "$WORK/jni-cuda13.jar" "$WORK/dist.jar" "$out"
+check "succeeds with a warning" "[ $? = 0 ] && grep -q 'WARNING: the JNI libraries were built with CUDA 13.0' $WORK/log"
+check "the override is in the provenance" "grep -q 'note cuda-major-override jni=13.0 distribution=12.9' $out.provenance"
+out=$WORK/out-cuda13-partial.jar
+make_jar "$WORK/jni-cuda13-extra.jar" "$ARCH" "$WORK/cuda13.so" "$WORK/classes-new" r1 jni libextra.so
+ALLOW_CUDA_MAJOR_MISMATCH=1 run "$WORK/jni-cuda13-extra.jar" "$WORK/dist.jar" "$out"
+check "but not when the native sets differ" "[ $? != 0 ] && [ ! -e $out ]"
 
 echo "--- verify-only on a jar whose manifest was replaced (the earlier behaviour)"
 python3 - "$WORK/out.jar" "$WORK/old-style.jar" <<'PY'

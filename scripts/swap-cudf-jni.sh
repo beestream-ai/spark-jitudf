@@ -36,6 +36,13 @@
 #   the dynamic symbol table (.dynsym) of one of this architecture's libraries -- read with a small
 #   ELF parser here, so the check is the same on every host and needs no binutils. A name that is
 #   only text in the file, only an undefined reference, hidden, local, or absent does not count.
+#   The distribution is read the same way, and the rule is relative to it: every native method that
+#   links in NVIDIA's release must still link, and the new binding must link. One that links in
+#   neither (an architecture built without cuFile, say) is reported and recorded, not refused.
+#
+#   ALLOW_CUDA_MAJOR_MISMATCH=1 lets a JNI artifact built with another CUDA major through, but only
+#   when it replaces the architecture's whole native set, so that the result's native code is all
+#   from one toolkit; the override is printed and written into the provenance.
 #
 #   For the deliverable, the RAPIDS distribution build is the better route; this is the
 #   development shortcut, made safe rather than replaced.
@@ -119,10 +126,11 @@ discard_candidate() {
   fi
   exit 3
 }
-python3 - "$JNI_JAR" "$IN_JAR" "$CANDIDATE" "$TARGET_ARCH" "${VERIFY_ONLY:-0}" <<'PY' || discard_candidate
+python3 - "$JNI_JAR" "$IN_JAR" "$CANDIDATE" "$TARGET_ARCH" "${VERIFY_ONLY:-0}" "${ALLOW_CUDA_MAJOR_MISMATCH:-0}" <<'PY' || discard_candidate
 import collections, hashlib, os, re, struct, sys, zipfile
 
-jni_path, in_path, out_path, target_arch, verify_only = sys.argv[1:6]
+jni_path, in_path, out_path, target_arch, verify_only, allow_cuda_mismatch = sys.argv[1:7]
+notes = []
 ELF_MACHINE = {"amd64": 62, "aarch64": 183}
 NEW_BINDING = ("ai/rapids/cudf/ColumnView", "transformMulti")
 TOOLKIT = re.compile(rb"Cuda compilation tools, release ([0-9]+)\.([0-9]+)")
@@ -324,55 +332,87 @@ with zipfile.ZipFile(jni_path) as jni, zipfile.ZipFile(in_path) as dist:
         fail(f"the CUDA toolkit of {'the JNI' if jni_cuda is None else 'the distribution'}'s libcudf.so cannot be established, "
              "so the classifier cannot be checked")
     elif jni_cuda != dist_cuda:
-        fail(f"the JNI libraries were built with CUDA {jni_cuda_text} and the distribution's with CUDA {dist_cuda_text}: "
-             f"a cuda{jni_cuda} artifact in a cuda{dist_cuda} distribution")
+        mismatch = (f"the JNI libraries were built with CUDA {jni_cuda_text} and the distribution's with CUDA {dist_cuda_text}: "
+                    f"a cuda{jni_cuda} artifact in a cuda{dist_cuda} distribution")
+        if allow_cuda_mismatch == "1" and jni_native == dist_native:
+            # Every native library of this architecture is being replaced, so the result's native
+            # code is all one toolkit; what remains different is only NVIDIA's packaging intent.
+            print("  WARNING: " + mismatch + ".")
+            print("  ALLOW_CUDA_MAJOR_MISMATCH=1 and the whole native set is replaced: proceeding, and recording it.")
+            notes.append(f"cuda-major-override jni={jni_cuda_text} distribution={dist_cuda_text}")
+        else:
+            fail(mismatch + ("" if allow_cuda_mismatch != "1" else " (the override applies only when every native library is replaced)"))
     else:
         print(f"  CUDA toolkit: {jni_cuda_text} (JNI) and {dist_cuda_text} (distribution), classifier cuda{jni_cuda}")
     # Java and native halves of the binding, linked the way the JVM will link them. The cuDF JNI
     # layer is linked into libcudf.so itself, so exports are gathered across this architecture's
-    # libraries rather than from one assumed file.
-    exports = {}
-    for n in sorted(jni_native):
-        try:
-            for symbol, status in elf_symbols(jni.read(n)).items():
-                if exports.get(symbol) != "exported":
-                    exports[symbol] = status
-        except ValueError as e:
-            fail(f"{n} has no readable ELF dynamic symbol table: {e}")
-    unresolved, checked, saw_new_binding = [], 0, False
-    for n in jni_names:
-        if not n.endswith(".class"):
-            continue
-        try:
-            cls, natives = native_methods(jni.read(n))
-        except (ValueError, struct.error, IndexError, UnicodeDecodeError) as e:
-            fail(f"{n} could not be read as a class file: {e}")
-            continue
-        overloads = collections.Counter(m for m, _ in natives)
-        for method, descriptor in natives:
-            checked += 1
-            short, long_ = jni_symbols(cls, method, descriptor)
-            if (cls, method) == NEW_BINDING:
-                saw_new_binding = True
-            if exports.get(long_) == "exported":
+    # libraries rather than from one assumed file. The distribution is measured the same way, so
+    # that the rule can be exact: nothing that links in NVIDIA's release may stop linking, and the
+    # new binding must link. A native that does not link in the release either (cuFile on an
+    # architecture built without it, say) is reported, not hidden and not blamed on the swap.
+    def gather_exports(z, libs, side):
+        found = {}
+        for n in sorted(libs):
+            try:
+                for symbol, status in elf_symbols(z.read(n)).items():
+                    if found.get(symbol) != "exported":
+                        found[symbol] = status
+            except ValueError as e:
+                fail(f"{side} {n} has no readable ELF dynamic symbol table: {e}")
+        return found
+
+    def linkage(z, names, exports, libs):
+        """{(class, method, descriptor): None if it links, else why not}."""
+        result = {}
+        for n in names:
+            if not n.endswith(".class"):
                 continue
-            if overloads[method] == 1 and exports.get(short) == "exported":
+            try:
+                cls, natives = native_methods(z.read(n))
+            except (ValueError, struct.error, IndexError, UnicodeDecodeError) as e:
+                fail(f"{n} could not be read as a class file: {e}")
                 continue
-            if overloads[method] > 1 and exports.get(short) == "exported":
-                why = "is overloaded, so the JVM needs the long name " + long_ + ", which is not exported"
-            else:
-                status = exports.get(short) or exports.get(long_)
-                if status is None:
-                    in_text = any(short.encode() in jni.read(lib) for lib in sorted(jni_native)) if (cls, method) == NEW_BINDING else False
-                    status = "present only as text in the file" if in_text else "absent"
-                why = f"needs {short}, which is {status}"
-            unresolved.append(f"{cls.replace('/', '.')}.{method}{descriptor} {why}")
-    if not saw_new_binding:
+            overloads = collections.Counter(m for m, _ in natives)
+            for method, descriptor in natives:
+                short, long_ = jni_symbols(cls, method, descriptor)
+                if exports.get(long_) == "exported" or (overloads[method] == 1 and exports.get(short) == "exported"):
+                    result[(cls, method, descriptor)] = None
+                    continue
+                if overloads[method] > 1 and exports.get(short) == "exported":
+                    why = "is overloaded, so the JVM needs the long name " + long_ + ", which is not exported"
+                else:
+                    status = exports.get(short) or exports.get(long_)
+                    if status is None:
+                        in_text = (cls, method) == NEW_BINDING and any(short.encode() in z.read(lib) for lib in sorted(libs))
+                        status = "present only as text in the file" if in_text else "absent"
+                    why = f"needs {short}, which is {status}"
+                result[(cls, method, descriptor)] = why
+        return result
+
+    jni_links = linkage(jni, jni_names, gather_exports(jni, jni_native, "JNI"), jni_native)
+    dist_links = linkage(dist, [n for n in dist_names if n.startswith("ai/rapids/cudf/") or n.startswith("com/nvidia/spark/rapids/jni/")],
+                         gather_exports(dist, dist_native, "distribution"), dist_native)
+    if not any(key[:2] == NEW_BINDING for key in jni_links):
         fail("ColumnView.class in the JNI jar declares no native transformMulti: it is not the generalized binding")
-    if unresolved:
-        fail(f"{len(unresolved)} of {checked} native methods would not link: " + "; ".join(unresolved[:4]))
+    broken, inherited = [], []
+    for key, why in sorted(jni_links.items()):
+        if why is None:
+            continue
+        label = f"{key[0].replace('/', '.')}.{key[1]}{key[2]} {why}"
+        if key[:2] != NEW_BINDING and key in dist_links and dist_links[key] is not None:
+            inherited.append(label)
+        else:
+            broken.append(label)
+    linked = sum(1 for why in jni_links.values() if why is None)
+    if broken:
+        fail(f"{len(broken)} of {len(jni_links)} native methods would not link, and each linked in the distribution or is new: " + "; ".join(broken[:4]))
     else:
-        print(f"  JNI linkage: all {checked} native methods resolve to exported functions (transformMulti among them)")
+        print(f"  JNI linkage: {linked} of {len(jni_links)} native methods resolve to exported functions, transformMulti among them;"
+              f" none that links in the distribution is lost")
+    if inherited:
+        print(f"  note: {len(inherited)} native method(s) link in neither the distribution nor the JNI jar (e.g. {inherited[0].split(' ')[0]}):"
+              " not part of NVIDIA's release for this architecture either")
+        notes.append(f"natives-unlinked-in-both {len(inherited)}")
     if "ai/rapids/cudf/OutputNullability.class" not in jni_names:
         fail("the JNI jar has no OutputNullability.class: it is not the generalized binding")
     # Nowhere else in the distribution may a second copy of cuDF's classes hide.
@@ -436,16 +476,16 @@ def sha256(path):
 # Provenance, beside the jar: which inputs, byte for byte, produced it. Verifying an existing jar
 # writes nothing -- its provenance is evidence about how it was built, and is printed instead.
 record = (f"jni {sha256(jni_path)} {os.path.abspath(jni_path)}\n" f"in {sha256(in_path)} {os.path.abspath(in_path)}\n"
-          f"out {sha256(out_path)}\n" f"arch {target_arch}\n")
+          f"out {sha256(out_path)}\n" f"arch {target_arch}\n" + "".join(f"note {n}\n" for n in notes))
 if verify_only == "1":
     print("  provenance of the inputs and the verified jar (not written):")
     print("".join("    " + line + "\n" for line in record.splitlines()), end="")
 else:
     with open(out_path + ".provenance", "w") as p:
         p.write(record)
-print("  verified: one architecture, exact native paths, matching revisions and CUDA major, every native")
-print("  method linked to an exported function, no duplicate entries, and the distribution's own")
-print("  manifest, licence and notice")
+print("  verified: one architecture, exact native paths, matching revisions" + (" (CUDA major override recorded)" if any(n.startswith("cuda-major-override") for n in notes) else " and CUDA major") + ",")
+print("  the new binding and every native the distribution links resolved to exported functions, no")
+print("  duplicate entries, and the distribution's own manifest, licence and notice")
 PY
 
 if [ "${VERIFY_ONLY:-0}" != "1" ]; then
