@@ -226,8 +226,10 @@ public final class SeparateExecutorTest {
             }
             java.util.Set<String> fresh = new java.util.HashSet<>(now);
             fresh.removeAll(original);
-            check("the replacement executor (" + fresh + ") ran tasks, with no TornadoVM", !fresh.isEmpty(), "executors seen: " + now + ", original " + original);
-            // The replacement has to compile the shipped source itself, from nothing.
+            check("the replacement executor (" + fresh + ") ran tasks, with no TornadoVM runtime", !fresh.isEmpty(), "executors seen: " + now + ", original " + original);
+            // The same query again, on a set of executors that now includes the replacement. Which
+            // executor ran which GPU partition -- and whether it compiled the kernel itself or found it
+            // in cuDF's kernel cache -- is not observed here; only that the results are still right.
             compare("a further query on the replacement executors", cpu, run(spark, base, query, true));
         } finally {
             spark.stop();
@@ -281,7 +283,7 @@ public final class SeparateExecutorTest {
         if (requireTwo) {
             check("at least two executor JVMs, none of them the driver (pid " + driverPid + ")", pids.size() >= 2 && !pids.contains(String.valueOf(driverPid)), pids.toString());
         }
-        check("no executor can load TornadoVM or sees a TornadoVM SDK", !tornado, facts.toString());
+        check("no executor can load the TornadoVM API or runtime, or sees a TornadoVM SDK", !tornado, facts.toString());
         check("every executor loads the generalized cuDF binding", binding, facts.toString());
         check("every executor loads the plugin's executor-side UDF class", plugin, facts.toString());
         return ids;
