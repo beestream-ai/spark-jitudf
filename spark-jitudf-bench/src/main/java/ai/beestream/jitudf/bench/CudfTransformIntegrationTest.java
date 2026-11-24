@@ -504,10 +504,16 @@ public final class CudfTransformIntegrationTest {
     private static void runZeroDivisorCase(SparkSession spark, int rows) {
         System.out.println();
         System.out.println("--- C7-divide-by-zero ---");
-        boolean cpuFailed = failsWith(spark, rows, "cudf_zero_div", false);
-        boolean gpuFailed = failsWith(spark, rows, "cudf_zero_div", true);
-        check("C7-divide-by-zero: CPU Spark fails the query", cpuFailed, "the CPU did not fail, so there is nothing to match");
-        check("C7-divide-by-zero: the GPU path fails it too, rather than answering", gpuFailed, "the GPU produced a result where the CPU raised");
+        String cpuFailure = failureOf(spark, rows, "cudf_zero_div", false);
+        String gpuFailure = failureOf(spark, rows, "cudf_zero_div", true);
+        // Not "any exception": a linkage error, an NVRTC rejection or a missing library would also
+        // fail the query, and none of them is the arithmetic failure this case is about.
+        check("C7-divide-by-zero: CPU Spark fails with ArithmeticException", cpuFailure != null && cpuFailure.contains("java.lang.ArithmeticException"),
+                String.valueOf(cpuFailure));
+        check("C7-divide-by-zero: the GPU path fails with cuDF's DIVISION_BY_ZERO, rather than answering",
+                gpuFailure != null && gpuFailure.contains("DIVISION_BY_ZERO"), String.valueOf(gpuFailure));
+        String plan = data(spark, rows).selectExpr("id", "cudf_zero_div(seed) as result").queryExecution().executedPlan().toString();
+        check("C7-divide-by-zero: the failing query was planned on the GPU UDF", plan.contains("gpu_cudf_zero_div"), firstLines(plan));
     }
 
     /**
@@ -638,19 +644,18 @@ public final class CudfTransformIntegrationTest {
         return df.queryExecution().executedPlan().toString();
     }
 
-    /** Whether the query throws, which is what both paths are supposed to do here. */
-    private static boolean failsWith(SparkSession spark, int rows, String udf, boolean enabled) {
+    /** The query's failure as its whole cause chain, or null when it did not fail. */
+    private static String failureOf(SparkSession spark, int rows, String udf, boolean enabled) {
         try {
             collect(spark, rows, udf, enabled);
-            return false;
+            return null;
         } catch (Exception e) {
-            Throwable root = e;
-            while (root.getCause() != null && root.getCause() != root) {
-                root = root.getCause();
+            StringBuilder chain = new StringBuilder();
+            for (Throwable t = e; t != null; t = t.getCause() == t ? null : t.getCause()) {
+                chain.append(t.getClass().getName()).append(": ").append(String.valueOf(t.getMessage()).lines().findFirst().orElse("")).append(" | ");
             }
-            System.out.println("  " + (enabled ? "gpu" : "cpu") + " raised " + root.getClass().getName() + ": "
-                    + String.valueOf(root.getMessage()).lines().findFirst().orElse(""));
-            return true;
+            System.out.println("  " + (enabled ? "gpu" : "cpu") + " raised " + chain);
+            return chain.toString();
         }
     }
 
