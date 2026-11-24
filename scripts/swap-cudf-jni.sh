@@ -433,12 +433,16 @@ def sha256(path):
             h.update(block)
     return h.hexdigest()
 
-# Provenance, beside the jar: which inputs, byte for byte, produced it.
-with open(out_path + ".provenance", "w") as p:
-    p.write(f"jni {sha256(jni_path)} {os.path.abspath(jni_path)}\n")
-    p.write(f"in {sha256(in_path)} {os.path.abspath(in_path)}\n")
-    p.write(f"out {sha256(out_path)}\n")
-    p.write(f"arch {target_arch}\n")
+# Provenance, beside the jar: which inputs, byte for byte, produced it. Verifying an existing jar
+# writes nothing -- its provenance is evidence about how it was built, and is printed instead.
+record = (f"jni {sha256(jni_path)} {os.path.abspath(jni_path)}\n" f"in {sha256(in_path)} {os.path.abspath(in_path)}\n"
+          f"out {sha256(out_path)}\n" f"arch {target_arch}\n")
+if verify_only == "1":
+    print("  provenance of the inputs and the verified jar (not written):")
+    print("".join("    " + line + "\n" for line in record.splitlines()), end="")
+else:
+    with open(out_path + ".provenance", "w") as p:
+        p.write(record)
 print("  verified: one architecture, exact native paths, matching revisions and CUDA major, every native")
 print("  method linked to an exported function, no duplicate entries, and the distribution's own")
 print("  manifest, licence and notice")
@@ -453,6 +457,6 @@ echo
 echo "=== what the result carries ==="
 unzip -p "$OUT_JAR" spark-rapids-jni-version-info.properties | sed 's/^/  jni  /'
 unzip -p "$OUT_JAR" cudf-java-version-info.properties | sed 's/^/  cudf /'
-sed 's/^/  provenance  /' "$OUT_JAR.provenance"
+[ -f "$OUT_JAR.provenance" ] && sed 's/^/  provenance  /' "$OUT_JAR.provenance"
 echo
 echo "use it with:  export RAPIDS_JAR=$OUT_JAR"

@@ -199,6 +199,12 @@ PY
 VERIFY_ONLY=1 run "$WORK/jni.jar" "$WORK/dist.jar" "$WORK/old-style.jar"
 check "is reported" "[ $? != 0 ] && grep -q 'MANIFEST.MF is not the distribution' $WORK/log"
 
+echo "--- verify-only on a good jar writes nothing beside it"
+cp -p "$WORK/out.jar.provenance" "$WORK/provenance.before"
+VERIFY_ONLY=1 run "$WORK/jni.jar" "$WORK/dist.jar" "$WORK/out.jar"
+check "passes" "[ $? = 0 ]"
+check "the existing provenance file is byte-identical" "cmp -s $WORK/out.jar.provenance $WORK/provenance.before"
+
 echo
 echo "=== CHECKS: $((PASS + FAIL)), FAILURES: $FAIL ==="
 [ "$FAIL" = 0 ]
