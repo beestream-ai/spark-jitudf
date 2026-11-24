@@ -520,7 +520,9 @@ public final class CodexDifferentialTest {
             Dataset<Row> minValues = base.selectExpr("id", "CAST(CASE WHEN (id & 7) = 0 THEN -2147483648 ELSE seed - 50000 END AS INT) AS x");
             expectGpu(spark, "2C x / -1, x % -1, floorDiv(x, -1) including MIN_VALUE", "by_minus_one", minValues, "by_minus_one(x)", false);
             expectGpu(spark, "2C x / (y | 1) needs no zero test", "or_one", divisors, "or_one(x, y)", false);
-            String mixed = "slice(array(seed % 13 - 6, seed % 7, seed * 3), 1, CAST(id & 3 AS INT))";
+            // Elements from bitwise arithmetic, which cannot be null: Spark types `%` as nullable, and a
+            // LIST whose elements may be null is (rightly) declined before any division is looked at.
+            String mixed = "slice(array((seed & 15) - 6, seed & 7, seed * 3), 1, CAST(id & 3 AS INT))";
             expectGpu(spark, "2C LIST fold dividing by a conditional element divisor", "list_cond_div", base, "list_cond_div(" + mixed + ")", false);
         } finally {
             spark.conf().set("spark.rapids.sql.udfCompiler.enabled", "true");
