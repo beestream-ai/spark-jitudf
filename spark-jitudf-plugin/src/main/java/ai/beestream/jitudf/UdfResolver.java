@@ -149,6 +149,28 @@ public final class UdfResolver {
      * forwards to the one object it captured.
      */
     private static ResolvedUdf resolveLambda(Object function, SerializedLambda lambda, int depth) throws Unresolvable {
+        ResolvedUdf target = lambdaTarget(function, lambda, depth);
+        // LambdaMetafactory can insert a cast, unbox, or widen before the implementation
+        // method. In particular (Integer)->int can reference a method accepting long.
+        var signature = java.lang.invoke.MethodType.fromMethodDescriptorString(lambda.getInstantiatedMethodType(), function.getClass().getClassLoader());
+        Class<?>[] parameters = target.method().getParameterTypes();
+        if (signature.parameterCount() != parameters.length) {
+            throw new Unresolvable("lambda arity differs from the selected implementation");
+        }
+        var invocation = signature.wrap();
+        var implementation = java.lang.invoke.MethodType.methodType(target.method().getReturnType(), parameters).wrap();
+        for (int i = 0; i < parameters.length; i++) {
+            if (!invocation.parameterType(i).isAssignableFrom(implementation.parameterType(i))) {
+                throw new Unresolvable("lambda argument adaptation changes the accepted type at position " + (i + 1));
+            }
+        }
+        if (!invocation.returnType().isAssignableFrom(implementation.returnType())) {
+            throw new Unresolvable("lambda result requires a conversion after the selected implementation");
+        }
+        return target;
+    }
+
+    private static ResolvedUdf lambdaTarget(Object function, SerializedLambda lambda, int depth) throws Unresolvable {
         int kind = lambda.getImplMethodKind();
         if ((kind == MethodHandleInfo.REF_invokeVirtual || kind == MethodHandleInfo.REF_invokeInterface) && lambda.getCapturedArgCount() == 1) {
             return resolveBoundMethodReference(lambda, depth);
@@ -184,7 +206,7 @@ public final class UdfResolver {
         }
         Forward forward;
         try {
-            forward = forwardedCall(impl);
+            forward = forwardedCall(impl, captured);
         } catch (Unresolvable e) {
             throw new Unresolvable("the wrapper " + lambda.getImplMethodName() + " does more than forward to what it captured (" + e.getMessage()
                     + "); compiling the captured object alone would change what is computed");
@@ -322,14 +344,17 @@ public final class UdfResolver {
         if (at >= code.size() || !isLoad(code.get(at++), Opcodes.ALOAD, 0)) {
             return null;
         }
+        String[] casts = new String[arguments.length];
+        int index = 0;
         int slot = 1;
         for (Type argument : arguments) {
             if (at >= code.size() || !isLoad(code.get(at++), argument.getOpcode(Opcodes.ILOAD), slot)) {
                 return null;
             }
             if (at < code.size() && code.get(at).getOpcode() == Opcodes.CHECKCAST) {
-                at++;
+                casts[index] = ((TypeInsnNode) code.get(at++)).desc;
             }
+            index++;
             slot += argument.getSize();
         }
         if (at >= code.size() || !(code.get(at) instanceof MethodInsnNode call)
@@ -337,9 +362,17 @@ public final class UdfResolver {
                 || Type.getArgumentTypes(call.desc).length != arguments.length) {
             return null;
         }
+        Type[] params = Type.getArgumentTypes(call.desc);
+        for (int i = 0; i < params.length; i++) {
+            if (casts[i] != null && !casts[i].equals(params[i].getInternalName())) {
+                return null;
+            }
+        }
         at++;
         if (at < code.size() && code.get(at).getOpcode() == Opcodes.CHECKCAST) {
-            at++;
+            if (!((TypeInsnNode) code.get(at++)).desc.equals(Type.getReturnType(call.desc).getInternalName())) {
+                return null;
+            }
         }
         if (at != code.size() - 1 || code.get(at).getOpcode() != Type.getReturnType(bridge.desc).getOpcode(Opcodes.IRETURN)) {
             return null;
@@ -352,14 +385,16 @@ public final class UdfResolver {
         final MethodInsnNode call;
         /** The wrapper's declared argument types, after the captured receiver. */
         final Type[] wrapperArguments;
+        final String[] argumentCasts;
         /** The type the result is cast to before it is returned, or null. */
         final String resultCast;
         /** Whether a null argument or result would behave differently in the wrapper than in the target. */
         final boolean nullSensitive;
 
-        Forward(MethodInsnNode call, Type[] wrapperArguments, String resultCast, boolean nullSensitive) {
+        Forward(MethodInsnNode call, Type[] wrapperArguments, String[] argumentCasts, String resultCast, boolean nullSensitive) {
             this.call = call;
             this.wrapperArguments = wrapperArguments;
+            this.argumentCasts = argumentCasts;
             this.resultCast = resultCast;
             this.nullSensitive = nullSensitive;
         }
@@ -381,6 +416,9 @@ public final class UdfResolver {
                 return "the wrapper forwards " + wrapperArguments.length + " arguments to a method taking " + declared.length;
             }
             for (int i = 0; i < declared.length; i++) {
+                if (argumentCasts[i] != null && !isSubtypeOf(declared[i], argumentCasts[i])) {
+                    return "the wrapper casts argument " + (i + 1) + " to " + argumentCasts[i] + ", which can fail before the forwarded call";
+                }
                 Type wrapper = wrapperArguments[i];
                 Type wanted = Type.getType(declared[i]);
                 if (wrapper.getSort() == Type.OBJECT && wrapper.getInternalName().equals("java/lang/Object")) {
@@ -400,6 +438,44 @@ public final class UdfResolver {
             }
             return null;
         }
+    }
+
+    /**
+     * Java's UDF interfaces declare checked exceptions. A typed adapter can satisfy that
+     * declaration by wrapping checked exceptions while rethrowing runtime exceptions unchanged.
+     * Eligible numeric bodies can raise unchecked exceptions only. Interpret the handler with
+     * that exception on its stack and require it to rethrow the identical object, without effects.
+     */
+    private static boolean rethrowsRuntimeException(AbstractInsnNode handler, int limit) {
+        var aliases = new java.util.HashSet<Integer>();
+        final int empty = 0, exception = 1, trueValue = 2;
+        int stack = exception;
+        AbstractInsnNode pc = handler;
+        for (int steps = 0; pc != null && steps <= limit; steps++) {
+            int op = pc.getOpcode();
+            if (op == Opcodes.ATHROW) {
+                return stack == exception;
+            }
+            if (op == Opcodes.ASTORE && stack == exception) {
+                aliases.add(((VarInsnNode) pc).var);
+                stack = empty;
+            } else if (op == Opcodes.ALOAD && stack == empty && aliases.contains(((VarInsnNode) pc).var)) {
+                stack = exception;
+            } else if ((op == Opcodes.INSTANCEOF || op == Opcodes.CHECKCAST) && stack == exception
+                    && isSubtypeOf(RuntimeException.class, ((TypeInsnNode) pc).desc)) {
+                stack = op == Opcodes.INSTANCEOF ? trueValue : exception;
+            } else if ((op == Opcodes.IFNE || op == Opcodes.IFEQ) && stack == trueValue) {
+                stack = empty;
+                if (op == Opcodes.IFNE) {
+                    pc = ((org.objectweb.asm.tree.JumpInsnNode) pc).label;
+                    continue;
+                }
+            } else if (op >= 0) {
+                return false;
+            }
+            pc = pc.getNext();
+        }
+        return false;
     }
 
     /**
@@ -423,22 +499,36 @@ public final class UdfResolver {
      * to compile it over a nullable column.
      * </p>
      */
-    static Forward forwardedCall(MethodNode impl) throws Unresolvable {
+    private static Forward forwardedCall(MethodNode impl, Object captured) throws Unresolvable {
         Type[] arguments = Type.getArgumentTypes(impl.desc);
         if (arguments.length < 1 || arguments[0].getSort() != Type.OBJECT) {
             throw new Unresolvable("its first argument is not the captured object");
         }
         List<AbstractInsnNode> code = realInstructions(impl);
+        if (!impl.tryCatchBlocks.isEmpty()) {
+            var handler = impl.tryCatchBlocks.get(0);
+            if (impl.tryCatchBlocks.size() != 1 || !("java/lang/Exception".equals(handler.type) || "java/lang/RuntimeException".equals(handler.type))
+                    || impl.instructions.indexOf(handler.end) > impl.instructions.indexOf(handler.handler)
+                    || !rethrowsRuntimeException(handler.handler, impl.instructions.size())) {
+                throw new Unresolvable("an exception handler can change the outcome of the forwarded call");
+            }
+            int handlerIndex = impl.instructions.indexOf(handler.handler);
+            code.removeIf(insn -> impl.instructions.indexOf(insn) >= handlerIndex);
+        }
         int at = 0;
         if (at >= code.size() || !isLoad(code.get(at++), Opcodes.ALOAD, 0)) {
             throw new Unresolvable("it does not start by loading what it captured");
         }
-        if (at < code.size() && code.get(at).getOpcode() == Opcodes.CHECKCAST) {
+        if (at < code.size() && code.get(at) instanceof TypeInsnNode cast && cast.getOpcode() == Opcodes.CHECKCAST) {
+            if (!isSubtypeOf(captured.getClass(), cast.desc)) {
+                throw new Unresolvable("the cast on the captured receiver can fail");
+            }
             at++;
         }
         boolean nullSensitive = false;
         int slot = arguments[0].getSize();
         Type[] own = new Type[arguments.length - 1];
+        String[] casts = new String[own.length];
         for (int i = 1; i < arguments.length; i++) {
             Type argument = arguments[i];
             own[i - 1] = argument;
@@ -453,7 +543,8 @@ public final class UdfResolver {
                 at++;
                 nullSensitive = true;
             }
-            if (at < code.size() && code.get(at).getOpcode() == Opcodes.CHECKCAST) {
+            if (at < code.size() && code.get(at) instanceof TypeInsnNode cast && cast.getOpcode() == Opcodes.CHECKCAST) {
+                casts[i - 1] = cast.desc;
                 at++;
             }
         }
@@ -482,7 +573,7 @@ public final class UdfResolver {
         if (Type.getReturnType(call.desc).getSort() == Type.VOID) {
             throw new Unresolvable("the forwarded call returns nothing");
         }
-        return new Forward(call, own, resultCast, nullSensitive);
+        return new Forward(call, own, casts, resultCast, nullSensitive);
     }
 
     private static boolean isBoxing(AbstractInsnNode insn, Type primitive) {

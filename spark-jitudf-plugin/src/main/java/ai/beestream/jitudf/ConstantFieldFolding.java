@@ -156,11 +156,109 @@ public final class ConstantFieldFolding {
             }
         }
         try {
+            String problem = serializationProblem(instance);
+            if (problem != null) {
+                return "the UDF's serialization can affect executor behavior: " + problem;
+            }
             roundTrip(instance);
             return null;
         } catch (Exception | LinkageError e) {
             return "the UDF object does not survive the Java serialization Spark ships it with: " + e;
         }
+    }
+
+    /**
+     * Shipping a CUDA payload bypasses deserialization of the original receiver. Even an unread
+     * reference can run a callback (including validation of a cyclic graph) or fail on the worker.
+     * Follow the actual default-serialized fields, stopping at primitive data and trusted leaves.
+     */
+    private static String serializationProblem(Object instance) throws IllegalAccessException {
+        var pending = new java.util.ArrayDeque<Object>();
+        var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        pending.add(instance);
+        while (!pending.isEmpty()) {
+            Object object = pending.remove();
+            Class<?> type = object.getClass();
+            if (!seen.add(object) || type == String.class || type == Boolean.class || type == Character.class
+                    || type == Byte.class || type == Short.class || type == Integer.class || type == Long.class || type == Float.class || type == Double.class) {
+                continue;
+            }
+            if (type.isArray()) {
+                if (!type.getComponentType().isPrimitive()) {
+                    for (Object element : (Object[]) object) {
+                        if (element != null) {
+                            pending.add(element);
+                        }
+                    }
+                }
+                continue;
+            }
+            String hook = hookThatDecidesFields(type);
+            if (hook != null) {
+                return type.getName() + " uses " + hook;
+            }
+            java.util.List<String> hooks = new java.util.ArrayList<>();
+            for (String[] spec : HOOKS) {
+                if (findHook(type, spec[0], spec[1]) != null) {
+                    hooks.add(spec[0] + spec[1]);
+                }
+            }
+            if (!hooks.isEmpty()) {
+                String why = whyNotDeterministic(type, hooks);
+                if (why != null) {
+                    return "cannot establish executor-invariant instance fields or callback behavior: " + why;
+                }
+            }
+            for (Class<?> c = type; c != Object.class; c = c.getSuperclass()) {
+                if (!java.io.Serializable.class.isAssignableFrom(c)) {
+                    if (!trivialConstructorChain(c)) {
+                        return c.getName() + " is initialized by a constructor on the executor";
+                    }
+                    break; // No state from this superclass is in the stream.
+                }
+                for (Field field : c.getDeclaredFields()) {
+                    int mods = field.getModifiers();
+                    if (Modifier.isStatic(mods)) {
+                        if (field.getName().equals("serialPersistentFields") && Modifier.isPrivate(mods) && Modifier.isFinal(mods)
+                                && field.getType() == java.io.ObjectStreamField[].class) {
+                            return c.getName() + " supplies its own persistent field list";
+                        }
+                    } else if (!field.getType().isPrimitive() && !Modifier.isTransient(mods)) {
+                        if (!field.trySetAccessible()) {
+                            return "cannot inspect serialized reference " + field;
+                        }
+                        Object value = field.get(object);
+                        if (value != null) {
+                            pending.add(value);
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** A default superclass constructor that only delegates has no executor-specific effects. */
+    private static boolean trivialConstructorChain(Class<?> type) {
+        for (Class<?> c = type; c != Object.class; c = c.getSuperclass()) {
+            byte[] bytes = UdfResolver.classFileOf(c);
+            if (bytes == null) {
+                return false;
+            }
+            ClassNode node = new ClassNode();
+            new ClassReader(bytes).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            var constructor = node.methods.stream().filter(m -> m.name.equals("<init>") && m.desc.equals("()V")).findFirst();
+            if (constructor.isEmpty()) {
+                return false;
+            }
+            var ops = java.util.Arrays.stream(constructor.get().instructions.toArray()).filter(op -> op.getOpcode() >= 0).toList();
+            if (ops.size() != 3 || !(ops.get(0) instanceof VarInsnNode load) || load.getOpcode() != Opcodes.ALOAD || load.var != 0
+                    || !(ops.get(1) instanceof org.objectweb.asm.tree.MethodInsnNode init) || init.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !init.owner.equals(node.superName) || !init.name.equals("<init>") || !init.desc.equals("()V") || ops.get(2).getOpcode() != Opcodes.RETURN) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -393,6 +491,9 @@ public final class ConstantFieldFolding {
                     return key + " calls " + call.owner.replace('/', '.') + "." + call.name + ", which may depend on the JVM it runs in";
                 }
                 if (insn instanceof FieldInsnNode field) {
+                    if (op == Opcodes.PUTFIELD && method.name.equals("writeObject")) {
+                        return "writeObject mutates the driver's instance while serializing it";
+                    }
                     if (op == Opcodes.GETSTATIC || op == Opcodes.PUTSTATIC) {
                         return key + " uses the static field " + field.name + ", which each JVM initialises for itself";
                     }
@@ -447,6 +548,14 @@ public final class ConstantFieldFolding {
     }
 
     private static int foldIn(MethodNode method, String owner, Class<?> declaringClass, Object instance, boolean resolved) {
+        if ((method.access & Opcodes.ACC_STATIC) != 0) {
+            return 0; // Slot zero is a parameter in a static helper.
+        }
+        for (AbstractInsnNode op : method.instructions) {
+            if (op instanceof VarInsnNode var && var.var == 0 && var.getOpcode() == Opcodes.ASTORE) {
+                return 0; // Slot zero no longer identifies the original receiver.
+            }
+        }
         int folded = 0;
         AbstractInsnNode insn = method.instructions.getFirst();
         while (insn != null) {

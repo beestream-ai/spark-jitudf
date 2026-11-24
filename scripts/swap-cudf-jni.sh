@@ -133,6 +133,7 @@ jni_path, in_path, out_path, target_arch, verify_only, allow_cuda_mismatch = sys
 notes = []
 ELF_MACHINE = {"amd64": 62, "aarch64": 183}
 NEW_BINDING = ("ai/rapids/cudf/ColumnView", "transformMulti")
+BINDING_DESCRIPTOR = "([JLjava/lang/String;ZIIZI)J"
 TOOLKIT = re.compile(rb"Cuda compilation tools, release ([0-9]+)\.([0-9]+)")
 errors = []
 
@@ -375,11 +376,12 @@ with zipfile.ZipFile(jni_path) as jni, zipfile.ZipFile(in_path) as dist:
             overloads = collections.Counter(m for m, _ in natives)
             for method, descriptor in natives:
                 short, long_ = jni_symbols(cls, method, descriptor)
-                if exports.get(long_) == "exported" or (overloads[method] == 1 and exports.get(short) == "exported"):
+                if ((exports.get(short) != "exported" and exports.get(long_) == "exported")
+                        or (overloads[method] == 1 and exports.get(short) == "exported")):
                     result[(cls, method, descriptor)] = None
                     continue
                 if overloads[method] > 1 and exports.get(short) == "exported":
-                    why = "is overloaded, so the JVM needs the long name " + long_ + ", which is not exported"
+                    why = "is overloaded and its short export shadows descriptor-specific JNI lookup"
                 else:
                     status = exports.get(short) or exports.get(long_)
                     if status is None:
@@ -394,6 +396,8 @@ with zipfile.ZipFile(jni_path) as jni, zipfile.ZipFile(in_path) as dist:
                          gather_exports(dist, dist_native, "distribution"), dist_native)
     if not any(key[:2] == NEW_BINDING for key in jni_links):
         fail("ColumnView.class in the JNI jar declares no native transformMulti: it is not the generalized binding")
+    elif (*NEW_BINDING, BINDING_DESCRIPTOR) not in jni_links:
+        fail("ColumnView.transformMulti has an incompatible native method descriptor")
     broken, inherited = [], []
     for key, why in sorted(jni_links.items()):
         if why is None:

@@ -175,6 +175,8 @@ public final class SeparateExecutorTest {
             List<Row> gpu = run(spark, base, query, true);
             compare("compiled on the driver, run on separate executors", cpu, gpu);
             String plan = plan(spark, base, query);
+            String decision = TornadoUdfProvider.decisions().getOrDefault("bitcount", "missing decision");
+            check("bitcount provider decision: " + decision, decision.startsWith("TORNADOVM_ELIGIBLE"), decision);
             check("bitcount runs as gpu_bitcount", plan.contains("gpu_bitcount"), plan);
             check("the LIST fold runs as gpu_active_days", plan.contains("gpu_active_days"), plan);
             check("the declined UDF is not compiled", !plan.contains("gpu_sin_in_int") && plan.contains("sin_in_int"), plan);

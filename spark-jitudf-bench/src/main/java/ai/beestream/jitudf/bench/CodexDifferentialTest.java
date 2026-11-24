@@ -474,6 +474,18 @@ public final class CodexDifferentialTest {
         scala.Function1<Long, Integer> scalaTyped = (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x);
         spark.udf().register("scala_typed_forwarder", new SparkUserDefinedFunction(scalaTyped, DataTypes.IntegerType,
                 seq(scala.Option.apply(Encoders.LONG())), scala.Option.apply(Encoders.INT()), scala.Option.apply("scala_typed_forwarder"), true, true));
+        scala.Function1<Long, Integer> checked = (scala.Function1<Long, Integer> & Serializable) x -> {
+            try {
+                return popcountInterface.call(x);
+            } catch (Exception failure) {
+                if (failure instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new RuntimeException(failure);
+            }
+        };
+        spark.udf().register("typed_interface", new SparkUserDefinedFunction(checked, DataTypes.IntegerType,
+                seq(scala.Option.apply(Encoders.LONG())), scala.Option.apply(Encoders.INT()), scala.Option.apply("typed_interface"), true, true));
         spark.udf().register("resolved_factor", new ResolvedFactorUdf(9), DataTypes.IntegerType);
         spark.udf().register("masked", new MaskedUdf(0xFFFF_0000L, true, 16), DataTypes.LongType);
         spark.udf().register("written_factor", new WrittenFactorUdf(9), DataTypes.IntegerType);
@@ -494,6 +506,7 @@ public final class CodexDifferentialTest {
             expectGpu(spark, "2A bridge in a generic child, extra overload", "bridged_child", base, "bridged_child(seed)", false);
             expectGpu(spark, "2A typed Java UDF1 forwarder (Codex's restored pattern)", "typed_forwarder", base, "typed_forwarder(seed * 2654435761)", false);
             expectGpu(spark, "2A plain Java UDF1 lambda", "java_lambda", base, "java_lambda(seed)", false);
+            expectGpu(spark, "2A typed Function1 forwarding to the checked interface", "typed_interface", base, "typed_interface(seed)", false);
             expectGpu(spark, "2A typed Scala Function1 forwarder", "scala_typed_forwarder", base, "scala_typed_forwarder(seed)", false);
 
             System.out.println("\n=== Second review B: executor-invariant constants ===");

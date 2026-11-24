@@ -334,6 +334,60 @@ class DispatchResolutionTest {
     }
 
     @Test
+    void forwardingMustPreserveAnExplicitArgumentCast() throws Exception {
+        UDF1<Object, Object> raw = cast(new Popcount());
+        UDF1<Object, Object> wrapper = value -> raw.call((String) value);
+        org.junit.jupiter.api.Assertions.assertThrows(ClassCastException.class, () -> wrapper.call(7L));
+        ProviderHarness.Outcome o = ProviderHarness.cudf(ToScalaUDF$.MODULE$.apply(wrapper), new DataType[] { L }, I, false, "wrong_cast");
+        assertFalse(o.accepted(), o::decision);
+    }
+
+    static scala.Function1<Long, Integer> typedInterfaceForwarder(UDF1<Long, Integer> inner) {
+        return (scala.Function1<Long, Integer> & Serializable) x -> {
+            try {
+                return inner.call(x);
+            } catch (Exception failure) {
+                if (failure instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new RuntimeException(failure);
+            }
+        };
+    }
+
+    @Test
+    void typedInterfaceForwarderPreservesRuntimeExceptions() {
+        var wrapper = typedInterfaceForwarder(new Popcount());
+        assertEquals(3, wrapper.apply(7L));
+        org.junit.jupiter.api.Assertions.assertThrows(NullPointerException.class, () -> wrapper.apply(null));
+        ProviderHarness.Outcome o = ProviderHarness.cudf(wrapper, new DataType[] { L }, I, false, "typed_interface_forwarder");
+        assertTrue(o.accepted(), o::decision);
+        UDF1<Long, Integer> inner = new Popcount();
+        scala.Function1<Long, Integer> recovering = (scala.Function1<Long, Integer> & Serializable) x -> {
+            try {
+                return inner.call(x);
+            } catch (Exception failure) {
+                return -1;
+            }
+        };
+        assertEquals(-1, recovering.apply(null));
+        assertFalse(ProviderHarness.cudf(recovering, new DataType[] { L }, I, true, "recovers").accepted());
+    }
+
+    private static int widePopcount(long x) {
+        return Long.bitCount(x);
+    }
+
+    @Test
+    void methodReferenceCannotBypassItsInstantiatedArgumentCast() throws Exception {
+        UDF1<Integer, Integer> widening = DispatchResolutionTest::widePopcount;
+        UDF1<Object, Integer> erased = cast(widening);
+        assertEquals(3, widening.call(7));
+        org.junit.jupiter.api.Assertions.assertThrows(ClassCastException.class, () -> erased.call(7L));
+        assertFalse(ProviderHarness.cudf(ToScalaUDF$.MODULE$.apply(widening), new DataType[] { L }, I, false, "widened").accepted());
+    }
+
+    @Test
     void ambiguousAndUnsupportedDispatchIsDeclined() {
         ProviderHarness.Outcome two = ProviderHarness.cudf(new TwoInterfaces(), new DataType[] { L }, I, false, "two");
         assertFalse(two.accepted(), two::decision);

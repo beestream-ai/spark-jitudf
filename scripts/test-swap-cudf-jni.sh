@@ -23,7 +23,7 @@ cat > "$WORK/java-new/ai/rapids/cudf/ColumnView.java" <<'JAVA'
 package ai.rapids.cudf;
 public class ColumnView {
   static native long transform(long view, String udf, boolean isPtx);
-  static native long transformMulti(long[] views, String udf, boolean isPtx, int outType, int nullability);
+  static native long transformMulti(long[] views, String udf, boolean isPtx, int outType, int scale, boolean nullAware, int nullability);
   static native long bitwise_op(long a, long b);
   static native long concat(long a);
   static native long concat(long a, long b);
@@ -166,6 +166,13 @@ refused "$WORK/jni-short.jar" "is overloaded" "overload by short name"
 echo "--- Java and native halves disagree: the classes are the old binding"
 make_jar "$WORK/jni-oldjava.jar" "$ARCH" "$WORK/exported.so" "$WORK/classes-old" r1 jni
 refused "$WORK/jni-oldjava.jar" "declares no native transformMulti" "old Java half"
+
+echo "--- correct short export but wrong Java native descriptor"
+mkdir -p "$WORK/wrong-desc/ai/rapids/cudf"
+sed 's/int scale, boolean nullAware, //' "$WORK/java-new/ai/rapids/cudf/ColumnView.java" > "$WORK/wrong-desc/ai/rapids/cudf/ColumnView.java"
+javac -d "$WORK/classes-wrong-desc" "$WORK/wrong-desc/ai/rapids/cudf/ColumnView.java" "$WORK/java-new/ai/rapids/cudf/OutputNullability.java"
+make_jar "$WORK/jni-desc.jar" "$ARCH" "$WORK/exported.so" "$WORK/classes-wrong-desc" r1 jni
+refused "$WORK/jni-desc.jar" "incompatible native method descriptor" "wrong descriptor"
 
 echo "--- a JNI artifact for the other architecture"
 make_jar "$WORK/jni-arm.jar" "$OTHER" "$WORK/exported.so" "$WORK/classes-new" r1 jni

@@ -345,6 +345,10 @@ class ExecutorInvariantFieldsTest {
 
     /** What a separate JVM started with {@code -Dreview.factor=property} computes for {@code xs}. */
     private String inExecutorJvm(UDF1<Integer, Integer> udf, String property, int... xs) throws Exception {
+        return inExecutorJvm(udf, property, null, xs);
+    }
+
+    private String inExecutorJvm(UDF1<Integer, Integer> udf, String property, String expectedFailure, int... xs) throws Exception {
         Path shipped = dir.resolve("udf-" + System.nanoTime() + ".bin");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
@@ -363,8 +367,13 @@ class ExecutorInvariantFieldsTest {
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         String output = new String(process.getInputStream().readAllBytes());
         assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the executor JVM did not finish");
-        assertEquals(0, process.exitValue(), output);
         assertNotEquals(ProcessHandle.current().pid(), process.pid());
+        if (expectedFailure != null) {
+            assertNotEquals(0, process.exitValue(), output);
+            assertTrue(output.contains(expectedFailure), output);
+            return output;
+        }
+        assertEquals(0, process.exitValue(), output);
         return output.lines().filter(l -> l.startsWith("RESULT ")).findFirst().orElseThrow(() -> new AssertionError(output)).substring(7);
     }
 
@@ -398,8 +407,87 @@ class ExecutorInvariantFieldsTest {
         assertTrue(classSwitch.contains("readResolve"), classSwitch);
     }
 
+    static class EmptyParent {
+    }
+
+    public static final class StableChild extends EmptyParent implements UDF1<Integer, Integer> {
+        private final int offset;
+
+        StableChild(int offset) {
+            this.offset = offset;
+        }
+
+        @Override
+        public Integer call(Integer x) {
+            return x + offset;
+        }
+    }
+
+    public static final class StatefulWriter implements UDF1<Integer, Integer> {
+        private final int factor;
+        private int writes;
+
+        public StatefulWriter(int factor) {
+            this.factor = factor;
+        }
+
+        @Override
+        public Integer call(Integer x) {
+            return factor + x;
+        }
+
+        private void writeObject(ObjectOutputStream out) throws IOException {
+            out.putFields().put("factor", ++writes);
+            out.writeFields();
+        }
+    }
+
+    @Test
+    void planningCannotAdvanceStatefulSerialization() {
+        StatefulWriter udf = new StatefulWriter(9);
+        ProviderHarness.Outcome o = ProviderHarness.cudf(udf, new DataType[] { I }, I, false, "writer");
+        assertFalse(o.accepted(), o::decision);
+        assertEquals(0, udf.writes);
+    }
+
+    public static final class ExecutorOnlyFailure implements UDF1<Integer, Integer> {
+        @Override
+        public Integer call(Integer x) {
+            return x + 1;
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            in.defaultReadObject();
+            if (Integer.getInteger("review.factor", 9) == 77) {
+                throw new java.io.InvalidObjectException("executor refused the UDF");
+            }
+        }
+    }
+
+    public static final class WithCallback implements UDF1<Integer, Integer> {
+        private final ExecutorOnlyFailure child = new ExecutorOnlyFailure();
+
+        @Override
+        public Integer call(Integer x) {
+            return x + 1;
+        }
+    }
+
+    @Test
+    void anUnusedFieldDoesNotMakeExecutorDeserializationEffectsUnobservable() throws Exception {
+        for (UDF1<Integer, Integer> udf : List.of(new ExecutorOnlyFailure(), new WithCallback())) {
+            assertEquals("8", inExecutorJvm(udf, null, 7));
+            inExecutorJvm(udf, "77", "java.io.InvalidObjectException: executor refused the UDF", 7);
+            ProviderHarness.Outcome o = ProviderHarness.cudf(ToScalaUDF$.MODULE$.apply(udf), new DataType[] { I }, I, false, "serialization_effect");
+            assertFalse(o.accepted(), o::decision);
+        }
+    }
+
     @Test
     void constructorConstantsStayEligibleAndMatchAnExecutorJvm() throws Exception {
+        StableChild stable = new StableChild(12);
+        assertEquals("19", inExecutorJvm(stable, "77", 7));
+        assertTrue(ProviderHarness.cudf(stable, new DataType[] { I }, I, false, "empty_parent").accepted());
         Offset offset = new Offset(41);
         ProviderHarness.Outcome o = ProviderHarness.cudf(ToScalaUDF$.MODULE$.apply(offset), new DataType[] { I }, I, false, "offset");
         assertTrue(o.accepted(), o::decision);

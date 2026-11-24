@@ -517,6 +517,13 @@ final class CoverageCorpus {
         UDF1<Long, Integer> popcountInterface = popcount;
         cases.add(new Case("S07", "Codex regression: typed forwarder Function1<Long,Integer> x -> inner.call(x)", Intent.SAFE,
                 (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x), new DataType[] { L }, I, false, false, null, null));
+        cases.add(new Case("S36", "typed Function1 forwarding through the checked Java interface, rethrowing runtime exceptions", Intent.SAFE,
+                DispatchResolutionTest.typedInterfaceForwarder(popcountInterface), new DataType[] { L }, I, false, false, null, null));
+        UDF1<Integer, Integer> wideningReference = Long::bitCount;
+        cases.add(new Case("G05", "Integer method reference requiring unbox and widening to long", Intent.GAP,
+                adapt.apply(wideningReference), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U40", "a Long input violates the Integer method reference's instantiated signature", Intent.UNSAFE,
+                adapt.apply(wideningReference), new DataType[] { L }, I, false, false));
         cases.add(new Case("S08", "erased forwarder Function1<Object,Object> x -> inner.call((Long) x)", Intent.SAFE,
                 (scala.Function1<Object, Object> & Serializable) x -> popcount.call((Long) x), new DataType[] { L }, I, false, false, null, null));
         UDF1<Long, Integer> javaForwarder = x -> popcountInterface.call(x);
@@ -530,6 +537,19 @@ final class CoverageCorpus {
         UDF1<Long, Integer> boundReference = popcount::call;
         cases.add(new Case("S34", "bound method reference popcount::call behind Spark's adapter", Intent.SAFE, adapt.apply(boundReference), new DataType[] { L }, I,
                 false, false, null, null));
+        @SuppressWarnings({ "unchecked", "rawtypes" })
+        UDF1<Object, Object> erasedPopcount = (UDF1) popcount;
+        UDF1<Object, Object> badCast = x -> erasedPopcount.call((String) x);
+        cases.add(new Case("U36", "forwarder casts a Long to String before erased dispatch", Intent.UNSAFE,
+                adapt.apply(badCast), new DataType[] { L }, I, false, false));
+        cases.add(new Case("U37", "readObject can fail on an executor even when call reads no fields", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.ExecutorOnlyFailure()), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U38", "an unread serialized child can fail during executor deserialization", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.WithCallback()), new DataType[] { I }, I, false, false));
+        cases.add(new Case("U39", "writeObject changes the driver's receiver while producing its stream", Intent.UNSAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.StatefulWriter(9)), new DataType[] { I }, I, false, false));
+        cases.add(new Case("S35", "stable constructor constant with an empty non-serializable base", Intent.SAFE,
+                adapt.apply(new ExecutorInvariantFieldsTest.StableChild(12)), new DataType[] { I }, I, false, false, null, null));
         cases.add(new Case("U26", "typed wrapper that adds one to the forwarded result", Intent.UNSAFE,
                 (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x) + 1, new DataType[] { L }, I, false, false));
         cases.add(new Case("U27", "forwarder with a side effect", Intent.UNSAFE, (scala.Function1<Long, Integer> & Serializable) x -> {
