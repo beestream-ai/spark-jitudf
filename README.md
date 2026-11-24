@@ -50,7 +50,7 @@ establish are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spa
 | Driver | 525 or newer, for CUDA 12 |
 | JDK | 21 |
 | Maven | 3.9 or newer |
-| TornadoVM | **8.1.0 or newer**, with the CUDA backend. Earlier versions lack the device-view API the cuDF buffers are bound through. The quickest way is SDKMAN: `sdk install tornadovm 8.1.0-jdk21-cuda`, which gives you a `TORNADO_SDK` directory directly. Otherwise [build it](https://tornadovm.readthedocs.io/en/latest/installation.html). |
+| TornadoVM | **Nothing to install to build.** The compiler the driver uses is `8.2.0-jdk21` on Maven Central, resolved like any other dependency; 8.2.0 is the first release carrying `TcCompiler.compileDeviceFunction`, so earlier versions cannot build the cuDF backend. A `TORNADO_SDK` directory with the CUDA backend is needed **only for the runtime backend** — `sdk install tornadovm 8.2.0-jdk21-cuda`, or [build it](https://tornadovm.readthedocs.io/en/latest/installation.html). The cuDF backend needs no TornadoVM at run time at all. |
 | Spark | 4.0.4, Scala 2.13, the stock binary distribution. Unmodified. |
 | RAPIDS | The released 26.08.1 jar, with the fork's classes patched in (below) |
 

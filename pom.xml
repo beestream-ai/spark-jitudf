@@ -60,18 +60,16 @@
          the generalized calls left out of the compilation. -->
     <cudf.jni.version>26.08.0-tcudf</cudf.jni.version>
     <cudf.jni.classifier>cuda12</cudf.jni.classifier>
-    <!-- The driver-side cuDF backend needs TcCompiler.compileDeviceFunction, which no release has
-         yet: 8.1.0-jdk21 on Maven Central does not carry it. Until the next TornadoVM release this
-         is a local `develop` install (`make` in a TornadoVM checkout installs it), and a build
-         without one cannot resolve these artifacts.
+    <!-- A published TornadoVM release, from Maven Central. This build needed a local `develop`
+         install until 2026-11-24, because the driver-side cuDF backend calls
+         TcCompiler.compileDeviceFunction and no release carried it; 8.2.0 is the first that does,
+         so nothing here has to be built by hand any more.
 
-         The runtime-based backend still works against a release, and nothing here forces the
-         version: -Dtornado.version=8.1.0-jdk21 builds against Maven Central, with the cuDF backend
-         left out of the compilation.
-
-         Running on a GPU also needs a built TornadoVM SDK with the CUDA backend (TORNADO_SDK) for
-         the runtime-based backend only; the cuDF backend needs no TornadoVM at run time at all. -->
-    <tornado.version>8.1.1-jdk21-dev</tornado.version>
+         Running on a GPU still needs a built TornadoVM SDK with the CUDA backend (TORNADO_SDK),
+         for the runtime-based backend only. The cuDF backend needs no TornadoVM at run time at
+         all, because it compiles on the driver and ships a string, which is why these artifacts
+         are on the driver's class path and absent from the executors entirely. -->
+    <tornado.version>8.2.0-jdk21</tornado.version>
     <asm.version>9.7.1</asm.version>
     <junit.version>5.10.2</junit.version>
   </properties>
