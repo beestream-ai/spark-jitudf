@@ -71,6 +71,9 @@ public final class JitCacheProbe {
 
         System.out.println("JITPROBE cache_path=" + String.valueOf(System.getenv("LIBCUDF_KERNEL_CACHE_PATH")));
         System.out.println("JITPROBE rows=" + rows + " distinct=" + distinct + " repeats=" + repeats);
+        // What jit-cache-experiment.sh checks this run against: this probe calls cuDF's transform
+        // directly, with no Spark plan in between.
+        System.out.println("JITPROBE mode=cudf-transform");
 
         long[] data = new long[rows];
         for (int i = 0; i < rows; i++) {

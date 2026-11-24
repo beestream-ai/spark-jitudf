@@ -176,6 +176,177 @@ public final class CodexDifferentialTest {
         }
     }
 
+    // ------------------------------------------------------------------------------ second review
+
+    /** Codex 2-A: the parent implements UDF2<Integer,Integer,Integer> returning x + 1 ... */
+    public static class BoxedParentUdf implements UDF2<Integer, Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer x, Integer y) {
+            return x + 1;
+        }
+    }
+
+    /** ... and the child adds call(int,int) returning x + 2, which Spark never calls. */
+    public static class PrimitiveOverloadChildUdf extends BoxedParentUdf {
+        private static final long serialVersionUID = 1L;
+
+        public int call(int x, int y) {
+            return x + 2;
+        }
+    }
+
+    public static final class InheritingChildUdf extends BoxedParentUdf {
+        private static final long serialVersionUID = 1L;
+    }
+
+    public abstract static class GenericBaseUdf<T> implements UDF1<T, Integer> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /** The bridge call(Object)Object is in this class and forwards to call(Long). */
+    public static final class BridgedChildUdf extends GenericBaseUdf<Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Long x) {
+            return Long.bitCount(x) * 3;
+        }
+
+        public Integer call(Integer x) {
+            return -1;
+        }
+    }
+
+    /** Codex 2-B: readResolve rebuilds the UDF from a system property of whichever JVM runs it. */
+    public static final class ResolvedFactorUdf implements UDF1<Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+        private final int factor;
+
+        public ResolvedFactorUdf(int factor) {
+            this.factor = factor;
+        }
+
+        @Override
+        public Integer call(Integer x) {
+            return x + factor;
+        }
+
+        private Object readResolve() {
+            return new ResolvedFactorUdf(Integer.getInteger("review.factor", 9));
+        }
+    }
+
+    /** Constructor constants: a long, a boolean and an int. */
+    public static final class MaskedUdf implements UDF1<Long, Long> {
+        private static final long serialVersionUID = 1L;
+        private final long mask;
+        private final boolean negate;
+        private final int shift;
+
+        public MaskedUdf(long mask, boolean negate, int shift) {
+            this.mask = mask;
+            this.negate = negate;
+            this.shift = shift;
+        }
+
+        @Override
+        public Long call(Long x) {
+            long v = (x & mask) >>> shift;
+            return negate ? -v : v;
+        }
+    }
+
+    /** writeObject streams factor * 100: executors see 900 for a driver instance holding 9. */
+    public static final class WrittenFactorUdf implements UDF1<Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+        private final int factor;
+
+        public WrittenFactorUdf(int factor) {
+            this.factor = factor;
+        }
+
+        @Override
+        public Integer call(Integer x) {
+            return x + factor;
+        }
+
+        private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+            java.io.ObjectOutputStream.PutField fields = out.putFields();
+            fields.put("factor", factor * 100);
+            out.writeFields();
+        }
+    }
+
+    /** Codex 2-C. */
+    public static final class CondFloorModUdf implements UDF2<Integer, Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer x, Integer y) {
+            return Math.floorMod(x, x == 7 ? y.intValue() : 3);
+        }
+    }
+
+    public static final class CondFloorDivUdf implements UDF2<Integer, Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer x, Integer y) {
+            return Math.floorDiv(x, x == 7 ? y.intValue() : 3);
+        }
+    }
+
+    public static final class CondFloorModLongUdf implements UDF2<Long, Long, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(Long x, Long y) {
+            long d;
+            if (x > 1000) {
+                d = 1000L;
+            } else if (x > 0) {
+                d = y;
+            } else {
+                d = -7L;
+            }
+            return Math.floorMod(x, d);
+        }
+    }
+
+    public static final class ByMinusOneUdf implements UDF1<Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer x) {
+            return x / -1 + x % -1 + Math.floorDiv(x, -1);
+        }
+    }
+
+    public static final class OrOneUdf implements UDF2<Integer, Integer, Integer> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Integer call(Integer x, Integer y) {
+            return x / (y | 1);
+        }
+    }
+
+    public static final class ListCondDivUdf implements UDF1<scala.collection.Seq<Long>, Long> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public Long call(scala.collection.Seq<Long> arr) {
+            long acc = 0;
+            for (int i = 0; i < arr.length(); i++) {
+                long v = arr.apply(i);
+                acc += 1000L / (v > 5 ? v : 3L);
+            }
+            return acc;
+        }
+    }
+
     /** A Scala-shaped function with a primitive parameter: Spark short-circuits a null to null. */
     public static long plusOne(long x) {
         return x + 1;
@@ -274,6 +445,8 @@ public final class CodexDifferentialTest {
                 spark.conf().set("spark.rapids.sql.incompatibleOps.enabled", "false");
             }
 
+            secondReview(spark, base);
+
             System.out.println("\n--- planning decisions ---");
             TornadoUdfProvider.decisions().forEach((name, decision) -> System.out.println("  " + name + " -> " + decision));
         } finally {
@@ -284,6 +457,81 @@ public final class CodexDifferentialTest {
         if (failures > 0) {
             System.exit(1);
         }
+    }
+
+    /** Codex's second review, through ordinary registration; see the fixtures above. */
+    private static void secondReview(SparkSession spark, Dataset<Row> base) {
+        spark.udf().register("inherited_overload", new PrimitiveOverloadChildUdf(), DataTypes.IntegerType);
+        spark.udf().register("inheriting_child", new InheritingChildUdf(), DataTypes.IntegerType);
+        spark.udf().register("bridged_child", new BridgedChildUdf(), DataTypes.IntegerType);
+        BitCountUdf popcount = new BitCountUdf();
+        UDF1<Long, Integer> popcountInterface = popcount;
+        UDF1<Long, Integer> typedForwarder = x -> popcountInterface.call(x);
+        spark.udf().register("typed_forwarder", typedForwarder, DataTypes.IntegerType);
+        UDF1<Long, Integer> javaLambda = x -> Long.bitCount(x) + 1;
+        spark.udf().register("java_lambda", javaLambda, DataTypes.IntegerType);
+        scala.Function1<Long, Integer> scalaTyped = (scala.Function1<Long, Integer> & Serializable) x -> popcount.call(x);
+        spark.udf().register("scala_typed_forwarder", new SparkUserDefinedFunction(scalaTyped, DataTypes.IntegerType,
+                seq(scala.Option.apply(Encoders.LONG())), scala.Option.apply(Encoders.INT()), scala.Option.apply("scala_typed_forwarder"), true, true));
+        spark.udf().register("resolved_factor", new ResolvedFactorUdf(9), DataTypes.IntegerType);
+        spark.udf().register("masked", new MaskedUdf(0xFFFF_0000L, true, 16), DataTypes.LongType);
+        spark.udf().register("written_factor", new WrittenFactorUdf(9), DataTypes.IntegerType);
+        spark.udf().register("cond_floor_mod", new CondFloorModUdf(), DataTypes.IntegerType);
+        spark.udf().register("cond_floor_div", new CondFloorDivUdf(), DataTypes.IntegerType);
+        spark.udf().register("cond_floor_mod_long", new CondFloorModLongUdf(), DataTypes.LongType);
+        spark.udf().register("by_minus_one", new ByMinusOneUdf(), DataTypes.IntegerType);
+        spark.udf().register("or_one", new OrOneUdf(), DataTypes.IntegerType);
+        spark.udf().register("list_cond_div", new ListCondDivUdf(), DataTypes.LongType);
+
+        spark.conf().set("spark.rapids.sql.udfCompiler.enabled", "false");
+        try {
+            System.out.println("\n=== Second review A: dispatch and forwarding ===");
+            Dataset<Row> pairs = base.selectExpr("id", "CAST(seed - 50000 AS INT) AS x", "CAST(id % 11 AS INT) AS y");
+            expectGpu(spark, "2A inherited call(Integer,Integer) with a call(int,int) overload in the child", "inherited_overload", pairs, "inherited_overload(x, y)", false);
+            check("2A the CPU reference is the inherited method (x + 1)", cpuValue(spark, pairs, "inherited_overload(x, y)", "x + 1"), "CPU differs from x + 1");
+            expectGpu(spark, "2A inherited implementation, child adds nothing", "inheriting_child", pairs, "inheriting_child(x, y)", false);
+            expectGpu(spark, "2A bridge in a generic child, extra overload", "bridged_child", base, "bridged_child(seed)", false);
+            expectGpu(spark, "2A typed Java UDF1 forwarder (Codex's restored pattern)", "typed_forwarder", base, "typed_forwarder(seed * 2654435761)", false);
+            expectGpu(spark, "2A plain Java UDF1 lambda", "java_lambda", base, "java_lambda(seed)", false);
+            expectGpu(spark, "2A typed Scala Function1 forwarder", "scala_typed_forwarder", base, "scala_typed_forwarder(seed)", false);
+
+            System.out.println("\n=== Second review B: executor-invariant constants ===");
+            Dataset<Row> ints = base.selectExpr("id", "CAST(seed - 50000 AS INT) AS x");
+            expectFallback(spark, "2B readResolve from a system property", "resolved_factor", ints, "resolved_factor(x)");
+            expectGpu(spark, "2B final long, boolean and int constants", "masked", base, "masked(seed * 2654435761)", false);
+            expectGpu(spark, "2B deterministic writeObject (executor sees 900)", "written_factor", ints, "written_factor(x)", false);
+            check("2B the CPU reference uses the streamed 900", cpuValue(spark, ints, "written_factor(x)", "x + 900"), "CPU differs from x + 900");
+
+            System.out.println("\n=== Second review C: conditional divisors ===");
+            Dataset<Row> divisors = base.selectExpr("id", "CAST(CASE WHEN (id & 15) = 0 THEN 7 ELSE seed % 40 - 20 END AS INT) AS x",
+                    "CAST(CASE WHEN (id & 15) = 0 THEN (id % 5) + 1 ELSE (id % 5) - 2 END AS INT) AS y").where("NOT (x = 7 AND y = 0)");
+            expectGpu(spark, "2C floorMod(x, x == 7 ? y : 3), no zero reaches it", "cond_floor_mod", divisors, "cond_floor_mod(x, y)", false);
+            expectGpu(spark, "2C floorDiv(x, x == 7 ? y : 3), no zero reaches it", "cond_floor_div", divisors, "cond_floor_div(x, y)", false);
+            Dataset<Row> zeroAt7 = base.selectExpr("id", "CAST(CASE WHEN (id & 15) = 0 THEN 7 ELSE seed % 40 - 20 END AS INT) AS x", "CAST(0 AS INT) AS y");
+            expectBothFail(spark, "2C floorMod(7, 0) fails the query", "cond_floor_mod", zeroAt7, "cond_floor_mod(x, y)", "java.lang.ArithmeticException", "DIVISION_BY_ZERO");
+            expectBothFail(spark, "2C floorDiv(7, 0) fails the query", "cond_floor_div", zeroAt7, "cond_floor_div(x, y)", "java.lang.ArithmeticException", "DIVISION_BY_ZERO");
+            Dataset<Row> zeroElsewhere = base.selectExpr("id", "CAST(seed % 40 - 20 AS INT) AS x", "CAST(0 AS INT) AS y").where("x <> 7");
+            expectGpu(spark, "2C y = 0 everywhere but x never 7: Java does not divide by y", "cond_floor_mod", zeroElsewhere, "cond_floor_mod(x, y)", false);
+            Dataset<Row> longs = base.selectExpr("id", "CASE WHEN (id & 3) = 0 THEN seed * 1000003 ELSE seed % 2000 - 1000 END AS x",
+                    "CASE WHEN (id & 7) = 1 THEN -3 ELSE (id % 9) + 1 END AS y");
+            expectGpu(spark, "2C long floorMod, divisor assigned on three paths", "cond_floor_mod_long", longs, "cond_floor_mod_long(x, y)", false);
+            expectBothFail(spark, "2C long floorMod reaching a zero divisor fails", "cond_floor_mod_long", longs.selectExpr("id", "abs(x) % 900 + 1 AS x", "0L AS y"),
+                    "cond_floor_mod_long(x, y)", "java.lang.ArithmeticException", "DIVISION_BY_ZERO");
+            Dataset<Row> minValues = base.selectExpr("id", "CAST(CASE WHEN (id & 7) = 0 THEN -2147483648 ELSE seed - 50000 END AS INT) AS x");
+            expectGpu(spark, "2C x / -1, x % -1, floorDiv(x, -1) including MIN_VALUE", "by_minus_one", minValues, "by_minus_one(x)", false);
+            expectGpu(spark, "2C x / (y | 1) needs no zero test", "or_one", divisors, "or_one(x, y)", false);
+            String mixed = "slice(array(seed % 13 - 6, seed % 7, seed * 3), 1, CAST(id & 3 AS INT))";
+            expectGpu(spark, "2C LIST fold dividing by a conditional element divisor", "list_cond_div", base, "list_cond_div(" + mixed + ")", false);
+        } finally {
+            spark.conf().set("spark.rapids.sql.udfCompiler.enabled", "true");
+        }
+    }
+
+    /** Whether CPU Spark's result equals {@code expected} on every row. */
+    private static boolean cpuValue(SparkSession spark, Dataset<Row> source, String call, String expected) {
+        spark.conf().set("spark.rapids.sql.enabled", "false");
+        spark.conf().set("spark.rapids.sql.tornadovm.enabled", "false");
+        return source.selectExpr(call + " AS a", expected + " AS b").where("NOT (a <=> b)").count() == 0;
     }
 
     @SafeVarargs

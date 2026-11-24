@@ -127,6 +127,10 @@ public final class SeparateExecutorTest {
                 .config("spark.rapids.memory.gpu.reserve", "536870912")
                 .config("spark.sql.shuffle.partitions", "4")
                 .config("spark.task.maxFailures", "4")
+                // Executors see a property the driver does not: the environment a readResolve, a
+                // readObject or a static initializer would read on an executor (Codex's second
+                // review, finding B). The driver JVM leaves review.factor unset.
+                .config("spark.executor.extraJavaOptions", "-Dreview.factor=77")
                 .getOrCreate();
         spark.sparkContext().setLogLevel("WARN");
         AtomicInteger failedTasks = new AtomicInteger();
@@ -176,6 +180,24 @@ public final class SeparateExecutorTest {
             check("the declined UDF is not compiled", !plan.contains("gpu_sin_in_int") && plan.contains("sin_in_int"), plan);
             check("the provider declined it for floating point",
                     TornadoUdfProvider.decisions().getOrDefault("sin_in_int", "").contains("floating point"), TornadoUdfProvider.decisions().toString());
+
+            System.out.println("\n=== state decided on the executor: driver has no review.factor, executors have 77 ===");
+            spark.udf().register("resolved_factor", new CodexDifferentialTest.ResolvedFactorUdf(9), DataTypes.IntegerType);
+            spark.udf().register("written_factor", new CodexDifferentialTest.WrittenFactorUdf(9), DataTypes.IntegerType);
+            check("the driver JVM has no review.factor", System.getProperty("review.factor") == null, System.getProperty("review.factor"));
+            Dataset<Row> ints = base.selectExpr("id", "CAST(id % 100000 AS INT) AS x");
+            String[] state = { "resolved_factor(x) AS r", "x + 77 AS executor_value", "x + 9 AS driver_value", "written_factor(x) AS w", "x + 900 AS streamed" };
+            List<Row> onExecutors = run(spark, ints, state, true);
+            long executorValued = onExecutors.stream().filter(r -> r.getInt(1) == r.getInt(2)).count();
+            long driverValued = onExecutors.stream().filter(r -> r.getInt(1) == r.getInt(3)).count();
+            check("readResolve: every row has the executors' x + 77, none the driver's x + 9", executorValued == onExecutors.size() && driverValued == 0,
+                    executorValued + " executor-valued, " + driverValued + " driver-valued of " + onExecutors.size());
+            check("deterministic writeObject: every row has the streamed x + 900", onExecutors.stream().allMatch(r -> r.getInt(4) == r.getInt(5)), "");
+            String statePlan = plan(spark, ints, state);
+            check("readResolve from the environment is not compiled", !statePlan.contains("gpu_resolved_factor") && statePlan.contains("resolved_factor"), statePlan);
+            check("the provider refused it for reading executor-decided state",
+                    TornadoUdfProvider.decisions().getOrDefault("resolved_factor", "").contains("instance field"), TornadoUdfProvider.decisions().toString());
+            check("the deterministic writeObject UDF is compiled", statePlan.contains("gpu_written_factor"), statePlan);
 
             System.out.println("\n=== a task fails once and is retried ===");
             int before = failedTasks.get();
