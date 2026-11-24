@@ -23,10 +23,19 @@
 #
 #   Before anything is written it checks that the JNI jar is for exactly the target architecture
 #   (directory and ELF header), replaces exactly the distribution's native paths for it, was built
-#   from the same pinned revisions, and carries both halves of the new binding; afterwards, that the
-#   result has no duplicate entries and still the distribution's manifest, licence and notice. A
-#   jar that fails any of that is never moved into place. A .provenance file beside the result
-#   records the SHA-256 of both inputs and of the output.
+#   from the same pinned revisions with the same CUDA toolkit major version (the classifier), and
+#   carries both halves of the binding linked to each other; afterwards, that the result has no
+#   duplicate entries and still the distribution's manifest, licence and notice. A jar that fails
+#   any of that is never moved into place. A .provenance file beside the result records the SHA-256
+#   of both inputs and of the output.
+#
+#   "Linked to each other" is checked the way the JVM will link them, not by searching for bytes.
+#   Every native method the JNI jar's classes declare is turned into the symbol the JVM looks up
+#   for it (JNI's short name, or the long name with the mangled argument descriptor when the
+#   method is overloaded), and that symbol must be a defined, global, default-visibility function in
+#   the dynamic symbol table (.dynsym) of one of this architecture's libraries -- read with a small
+#   ELF parser here, so the check is the same on every host and needs no binutils. A name that is
+#   only text in the file, only an undefined reference, hidden, local, or absent does not count.
 #
 #   For the deliverable, the RAPIDS distribution build is the better route; this is the
 #   development shortcut, made safe rather than replaced.
@@ -111,12 +120,136 @@ discard_candidate() {
   exit 3
 }
 python3 - "$JNI_JAR" "$IN_JAR" "$CANDIDATE" "$TARGET_ARCH" "${VERIFY_ONLY:-0}" <<'PY' || discard_candidate
-import hashlib, os, re, sys, zipfile
+import collections, hashlib, os, re, struct, sys, zipfile
 
 jni_path, in_path, out_path, target_arch, verify_only = sys.argv[1:6]
 ELF_MACHINE = {"amd64": 62, "aarch64": 183}
-NEW_SYMBOL = b"Java_ai_rapids_cudf_ColumnView_transformMulti"
+NEW_BINDING = ("ai/rapids/cudf/ColumnView", "transformMulti")
+TOOLKIT = re.compile(rb"Cuda compilation tools, release ([0-9]+)\.([0-9]+)")
 errors = []
+
+def elf_symbols(data):
+    """Every named symbol of an ELF64 little-endian shared object, classified the way the dynamic
+    linker sees it. Raises ValueError for a file that is not one."""
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise ValueError("not a little-endian ELF64 file")
+    try:
+        shoff, = struct.unpack_from("<Q", data, 0x28)
+        shentsize, shnum = struct.unpack_from("<HH", data, 0x3A)
+        if shoff == 0 or shnum == 0 or shoff + shentsize * shnum > len(data):
+            raise ValueError("no section header table")
+        sections = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize) for i in range(shnum)]
+        symbols = {}
+        for kind, dynamic in ((11, True), (2, False)):  # SHT_DYNSYM, then SHT_SYMTAB
+            for sec in sections:
+                if sec[1] != kind:
+                    continue
+                strtab = sections[sec[6]]
+                for off in range(sec[4], sec[4] + sec[5], 24):
+                    st_name, st_info, st_other, st_shndx = struct.unpack_from("<IBBH", data, off)
+                    start = strtab[4] + st_name
+                    name = data[start:data.index(b"\0", start)].decode("latin-1")
+                    if not name:
+                        continue
+                    if not dynamic:
+                        symbols.setdefault(name, "defined only in the static symbol table, not exported")
+                        continue
+                    bind, kind_, visibility = st_info >> 4, st_info & 0xF, st_other & 3
+                    if st_shndx == 0:
+                        status = "an undefined reference, not a definition"
+                    elif bind == 0:
+                        status = "a local symbol, not exported"
+                    elif visibility in (1, 2):
+                        status = "hidden, not exported"
+                    elif kind_ not in (2, 10):  # STT_FUNC, STT_GNU_IFUNC
+                        status = "exported, but not a function"
+                    else:
+                        status = "exported"
+                    if symbols.get(name) != "exported":
+                        symbols[name] = status
+        if not any(sec[1] == 11 for sec in sections):
+            raise ValueError("no dynamic symbol table")
+        return symbols
+    except struct.error as e:
+        raise ValueError(f"truncated ELF file ({e})")
+
+def native_methods(classfile):
+    """(class name, [(method, descriptor)]) for the native methods a class file declares."""
+    d = classfile
+    if d[:4] != b"\xca\xfe\xba\xbe":
+        raise ValueError("not a class file")
+    count, = struct.unpack_from(">H", d, 8)
+    pool, i, p = [None] * count, 1, 10
+    while i < count:
+        tag = d[p]
+        if tag == 1:
+            n, = struct.unpack_from(">H", d, p + 1)
+            pool[i] = d[p + 3:p + 3 + n].decode("utf-8", "surrogatepass")
+            p += 3 + n
+        elif tag in (3, 4):
+            p += 5
+        elif tag in (5, 6):
+            p += 9
+            i += 1
+        elif tag in (7, 8, 16, 19, 20):
+            pool[i] = struct.unpack_from(">H", d, p + 1)[0]
+            p += 3
+        elif tag in (9, 10, 11, 12, 17, 18):
+            p += 5
+        elif tag == 15:
+            p += 4
+        else:
+            raise ValueError(f"unknown constant pool tag {tag}")
+        i += 1
+    this_class, = struct.unpack_from(">H", d, p + 2)
+    name = pool[pool[this_class]]
+    p += 6
+    interfaces, = struct.unpack_from(">H", d, p)
+    p += 2 + 2 * interfaces
+    members = []
+    for _ in range(2):  # fields, then methods
+        n, = struct.unpack_from(">H", d, p)
+        p += 2
+        members = []
+        for _ in range(n):
+            access, name_index, desc_index, attributes = struct.unpack_from(">HHHH", d, p)
+            p += 8
+            for _ in range(attributes):
+                length, = struct.unpack_from(">I", d, p + 2)
+                p += 6 + length
+            members.append((access, pool[name_index], pool[desc_index]))
+    return name, [(m, desc) for access, m, desc in members if access & 0x0100]
+
+def jni_mangle(text):
+    out = []
+    for ch in text:
+        if ch == "/":
+            out.append("_")
+        elif ch == "_":
+            out.append("_1")
+        elif ch == ";":
+            out.append("_2")
+        elif ch == "[":
+            out.append("_3")
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch)
+        else:
+            out.append("_0%04x" % ord(ch))
+    return "".join(out)
+
+def jni_symbols(cls, method, descriptor):
+    """The short and long names the JVM looks up for a native method (JNI spec, "Resolving Native
+    Method Names")."""
+    short = "Java_" + jni_mangle(cls) + "_" + jni_mangle(method)
+    return short, short + "__" + jni_mangle(descriptor[1:descriptor.index(")")])
+
+def toolkit_major(z, names):
+    for n in names:
+        if n.endswith("/libcudf.so"):
+            m = TOOLKIT.search(z.read(n))
+            if m:
+                return int(m.group(1)), f"{int(m.group(1))}.{int(m.group(2))}"
+    return None, None
 
 def fail(message):
     errors.append(message)
@@ -183,11 +316,63 @@ with zipfile.ZipFile(jni_path) as jni, zipfile.ZipFile(in_path) as dist:
             fail(f"{stamp}: JNI revision {a.get('revision')} is not the distribution's {b.get('revision')}")
         else:
             print(f"  {stamp}: revision {a['revision'][:12]} on both sides; version {b.get('version')} -> {a.get('version')}")
-    # Java and native halves of the new binding together. The cudf JNI layer is linked into
-    # libcudf.so itself (nm -D shows the Java_ai_rapids_cudf_* exports there), so the symbol is
-    # looked for across this architecture's libraries rather than in one assumed file.
-    if not any(NEW_SYMBOL in jni.read(n) for n in sorted(jni_native)):
-        fail(f"no {target_arch} native library exports {NEW_SYMBOL.decode()}, which the new ColumnView.transform calls")
+    # The CUDA toolkit the libraries were compiled with -- what the cuda12/cuda13 classifier names.
+    # nvcc records it in every object it compiles; mixing majors in one jar mixes runtimes.
+    jni_cuda, jni_cuda_text = toolkit_major(jni, sorted(jni_native))
+    dist_cuda, dist_cuda_text = toolkit_major(dist, sorted(dist_native))
+    if jni_cuda is None or dist_cuda is None:
+        fail(f"the CUDA toolkit of {'the JNI' if jni_cuda is None else 'the distribution'}'s libcudf.so cannot be established, "
+             "so the classifier cannot be checked")
+    elif jni_cuda != dist_cuda:
+        fail(f"the JNI libraries were built with CUDA {jni_cuda_text} and the distribution's with CUDA {dist_cuda_text}: "
+             f"a cuda{jni_cuda} artifact in a cuda{dist_cuda} distribution")
+    else:
+        print(f"  CUDA toolkit: {jni_cuda_text} (JNI) and {dist_cuda_text} (distribution), classifier cuda{jni_cuda}")
+    # Java and native halves of the binding, linked the way the JVM will link them. The cuDF JNI
+    # layer is linked into libcudf.so itself, so exports are gathered across this architecture's
+    # libraries rather than from one assumed file.
+    exports = {}
+    for n in sorted(jni_native):
+        try:
+            for symbol, status in elf_symbols(jni.read(n)).items():
+                if exports.get(symbol) != "exported":
+                    exports[symbol] = status
+        except ValueError as e:
+            fail(f"{n} has no readable ELF dynamic symbol table: {e}")
+    unresolved, checked, saw_new_binding = [], 0, False
+    for n in jni_names:
+        if not n.endswith(".class"):
+            continue
+        try:
+            cls, natives = native_methods(jni.read(n))
+        except (ValueError, struct.error, IndexError, UnicodeDecodeError) as e:
+            fail(f"{n} could not be read as a class file: {e}")
+            continue
+        overloads = collections.Counter(m for m, _ in natives)
+        for method, descriptor in natives:
+            checked += 1
+            short, long_ = jni_symbols(cls, method, descriptor)
+            if (cls, method) == NEW_BINDING:
+                saw_new_binding = True
+            if exports.get(long_) == "exported":
+                continue
+            if overloads[method] == 1 and exports.get(short) == "exported":
+                continue
+            if overloads[method] > 1 and exports.get(short) == "exported":
+                why = "is overloaded, so the JVM needs the long name " + long_ + ", which is not exported"
+            else:
+                status = exports.get(short) or exports.get(long_)
+                if status is None:
+                    in_text = any(short.encode() in jni.read(lib) for lib in sorted(jni_native)) if (cls, method) == NEW_BINDING else False
+                    status = "present only as text in the file" if in_text else "absent"
+                why = f"needs {short}, which is {status}"
+            unresolved.append(f"{cls.replace('/', '.')}.{method}{descriptor} {why}")
+    if not saw_new_binding:
+        fail("ColumnView.class in the JNI jar declares no native transformMulti: it is not the generalized binding")
+    if unresolved:
+        fail(f"{len(unresolved)} of {checked} native methods would not link: " + "; ".join(unresolved[:4]))
+    else:
+        print(f"  JNI linkage: all {checked} native methods resolve to exported functions (transformMulti among them)")
     if "ai/rapids/cudf/OutputNullability.class" not in jni_names:
         fail("the JNI jar has no OutputNullability.class: it is not the generalized binding")
     # Nowhere else in the distribution may a second copy of cuDF's classes hide.
@@ -254,8 +439,9 @@ with open(out_path + ".provenance", "w") as p:
     p.write(f"in {sha256(in_path)} {os.path.abspath(in_path)}\n")
     p.write(f"out {sha256(out_path)}\n")
     p.write(f"arch {target_arch}\n")
-print("  verified: one architecture, exact native paths, matching revisions, the new JNI symbol,")
-print("  no duplicate entries, and the distribution's own manifest, licence and notice")
+print("  verified: one architecture, exact native paths, matching revisions and CUDA major, every native")
+print("  method linked to an exported function, no duplicate entries, and the distribution's own")
+print("  manifest, licence and notice")
 PY
 
 if [ "${VERIFY_ONLY:-0}" != "1" ]; then
