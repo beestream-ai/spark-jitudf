@@ -72,6 +72,17 @@ public final class TornadoUdfProvider {
     private TornadoUdfProvider() {
     }
 
+    /** The bridge clones CPU functions on workers. Signal when only the original Spark receiver is safe. */
+    public static Object tryCompile(Object function, DataType[] inputTypes, DataType outputType, boolean inputsNullable, boolean deterministic, String udfName, String[] rejectionReasons,
+            String diagnostics, Runnable requireOriginalReceiver) {
+        Object compiled = tryCompile(function, inputTypes, outputType, inputsNullable, deterministic, udfName, rejectionReasons, diagnostics);
+        // Even an eligible child can be folded into a surrounding CPU bridge by its optimizer.
+        if (!ConstantFieldFolding.canCloneOnWorker(function)) {
+            requireOriginalReceiver.run();
+        }
+        return compiled;
+    }
+
     /**
      * Tries to build a GPU implementation of a UDF that RAPIDS declined.
      *
@@ -117,7 +128,7 @@ public final class TornadoUdfProvider {
             if (shipping != null) {
                 return refuse(name, shipping);
             }
-            ResolvedUdf resolved = ConstantFieldFolding.fold(found);
+            ResolvedUdf resolved = ConstantFieldFolding.foldShippable(found);
 
             ResolvedUdf resolvedUdf = resolved;
             // The cudf backend can report an arithmetic error back to Spark (see TcCudaCompiler); the
@@ -152,6 +163,9 @@ public final class TornadoUdfProvider {
                 // the entry returns a cudf error code instead of nothing, which is different source.
                 String key = KernelIdentity.of(resolvedUdf, eligibility.inputs(), eligibility.outputKind())
                         + (eligibility.reportsArithmeticErrors() ? "+errc" : "") + (eligibility.isNullAware() ? "+null" : "");
+                if (eligibility.isNullAware() && resolvedUdf.adapterDescriptor() != null) {
+                    key += "+unbox" + resolvedUdf.adapterDescriptor();
+                }
                 return cudfTransformUdf(name, resolvedUdf, eligibility, key);
             }
 

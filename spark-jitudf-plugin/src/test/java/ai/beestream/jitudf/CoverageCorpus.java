@@ -400,6 +400,108 @@ final class CoverageCorpus {
     }
 
     @SuppressWarnings("unchecked")
+    record Scale(long factor, boolean negative) implements UDF1<Long, Long> {
+        public Long call(Long x) { return negative ? -x * factor : x * factor; }
+    }
+
+    record Nonnegative(int offset) implements UDF1<Integer, Integer> {
+        Nonnegative { if (offset < 0) offset = 0; }
+        public Integer call(Integer x) { return x + offset; }
+    }
+
+    record ShiftOnRead(int k) implements UDF1<Integer, Integer> {
+        ShiftOnRead { k++; }
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    record WorkerOffset(int k) implements UDF1<Integer, Integer> {
+        WorkerOffset { k = Integer.getInteger("review.factor", k); }
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    record WorkerGuard(int k) implements Serializable {
+        WorkerGuard { if (Integer.getInteger("review.factor", 9) == 77) throw new IllegalStateException("worker guard"); }
+    }
+
+    record WithGuard(int k, WorkerGuard guard) implements UDF1<Integer, Integer> {
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    record ReconstructedAgain(int k) implements UDF1<Integer, Integer> {
+        private Object readResolve() { return new ReconstructedAgain(k + 1); }
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    record ProxyOffset(int k) implements UDF1<Integer, Integer> {
+        private Object writeReplace() { return new WorkerOffset(k); }
+        public Integer call(Integer x) { return x - k; }
+    }
+
+    record GuardedMetadata(int offset, Object tag) implements UDF1<Integer, Integer> {
+        GuardedMetadata { if (tag != null && offset < 0) offset = 0; }
+        public Integer call(Integer x) { return x + offset; }
+    }
+
+    record Unread(int k, Object value) implements UDF1<Integer, Integer> {
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    static int twice(int x) { return x * 2; }
+    static long widerResult(int x) { return (long) x * 3; }
+    static Integer boxedTwice(Integer x) { return x == null ? 42 : x * 2; }
+    static Integer mixed(int x, Integer y) { return y == null ? x : x + y; }
+
+    static long ignoreSecond(long first, long unused) { return first; }
+    static long wideMixed(long first, Integer second, long third) { return first + (second == null ? 42 : second) - third; }
+
+    static Long wideBoxedResult(long first, Integer second, long third) { return first + second - third; }
+
+    static void addRecordAndReferenceCases(List<Case> cases) {
+        DataType[] ints = { I };
+        DataType[] longs = { L };
+        DataType[] pair = { I, I };
+        var worker = new WorkerOffset(9);
+        UDF1<Integer, Integer> twiceRef = CoverageCorpus::twice;
+        UDF2<Integer, Integer, Integer> mixedRef = CoverageCorpus::mixed;
+        cases.add(new Case("R01", "record with long and boolean components", Intent.SAFE, new Scale(11, false), longs, L, false, false));
+        cases.add(new Case("R02", "second instance with different components", Intent.SAFE, new Scale(42, true), longs, L, false, false));
+        cases.add(new Case("R03", "record normalizes a negative configuration", Intent.SAFE, new Nonnegative(-4), ints, I, false, false));
+        cases.add(new Case("R04", "record consults an executor property", Intent.UNSAFE, worker, ints, I, false, false));
+        cases.add(new Case("R05", "bound reference on an executor-dependent record", Intent.UNSAFE, (UDF1<Integer, Integer>) worker::call, ints, I, false, false));
+        cases.add(new Case("R06", "forwarder on an executor-dependent record", Intent.UNSAFE, (UDF1<Integer, Integer>) x -> worker.call(x), ints, I, false, false));
+        cases.add(new Case("R07", "unread nested record can fail on worker", Intent.UNSAFE, new WithGuard(9, new WorkerGuard(1)), ints, I, false, false));
+        cases.add(new Case("R08", "record serialization proxy", Intent.UNSAFE, new ProxyOffset(9), ints, I, false, false));
+        cases.add(new Case("R09", "pure constructor changes component on every shipment", Intent.UNSAFE, new ShiftOnRead(9), ints, I, false, false));
+        cases.add(new Case("R10", "plain record with an unread String component", Intent.SAFE, new Unread(3, "label"), ints, I, false, false));
+        cases.add(new Case("R11", "plain record with an unread enum", Intent.GAP, new Unread(3, Intent.SAFE), ints, I, false, false));
+        cases.add(new Case("R12", "plain record with an unread ArrayList", Intent.GAP, new Unread(3, new ArrayList<>()), ints, I, false, false));
+        cases.add(new Case("R13", "pure readResolve changes record component on every shipment", Intent.UNSAFE, new ReconstructedAgain(9), ints, I, false, false));
+        cases.add(new Case("R14", "computed constructor tests an immutable metadata component", Intent.SAFE,
+                new GuardedMetadata(-1, "label"), ints, I, false, false));
+        cases.add(new Case("R15", "computed constructor tests an array reference (stable in this instance)", Intent.GAP,
+                new GuardedMetadata(-1, new int[] { 1 }), ints, I, false, false));
+        cases.add(new Case("M01", "static int reference over non-null input", Intent.SAFE, twiceRef, ints, I, false, false));
+        cases.add(new Case("M02", "static int reference over nullable input", Intent.SAFE, twiceRef, ints, I, true, false, "reports unboxing failure", c -> c.contains("arg0_valid == 0) return 3")));
+        cases.add(new Case("M03", "boxed static reference handles null", Intent.SAFE, (UDF1<Integer, Integer>) CoverageCorpus::boxedTwice, ints, I, true, false));
+        cases.add(new Case("M04", "static primitive method widens inside body", Intent.SAFE, (UDF1<Integer, Long>) CoverageCorpus::widerResult, ints, L, false, false));
+        cases.add(new Case("M05", "static long reference", Intent.SAFE, (UDF1<Long, Long>) Math::abs, longs, L, false, false));
+        cases.add(new Case("M06", "two primitive arguments with a nullable operand", Intent.SAFE, (UDF2<Integer, Integer, Integer>) Math::floorMod, pair, I, true, false, "reports unboxing failure", c -> c.contains("arg0_valid == 0) return 3") && c.contains("arg1_valid == 0) return 3")));
+        cases.add(new Case("M07", "mixed reference, unboxed operand may be null", Intent.SAFE, mixedRef, pair, I, true, false, "reports unboxing failure", c -> c.contains("arg0_valid == 0) return 3")));
+        cases.add(new Case("M08", "mixed reference, both inputs non-null", Intent.SAFE, mixedRef, pair, I, false, false));
+        cases.add(new Case("M09", "mixed reference, only boxed operand nullable (bridge supplies one bit)", Intent.SAFE, mixedRef, pair, I, true, false));
+        cases.add(new Case("M10", "second primitive operand must unbox even if never read", Intent.SAFE,
+                (UDF2<Long, Long, Long>) CoverageCorpus::ignoreSecond, new DataType[] { L, L }, L, true, false,
+                "both primitive arguments unbox", c -> c.contains("arg0_valid == 0LL) return 3") && c.contains("arg1_valid == 0LL) return 3")));
+        cases.add(new Case("M11", "wide primitive result and reference comparison in the target", Intent.GAP,
+                (UDF3<Long, Integer, Long, Long>) CoverageCorpus::wideMixed, new DataType[] { L, I, L }, L, true, false));
+        cases.add(new Case("M12", "two wide arguments around a nullable box", Intent.SAFE,
+                (UDF3<Long, Integer, Long, Long>) CoverageCorpus::wideBoxedResult, new DataType[] { L, I, L }, L, true, false,
+                "both long arguments unbox", c -> c.contains("arg0_valid == 0LL) return 3") && c.contains("arg2_valid == 0LL) return 3")));
+        scala.runtime.java8.JFunction1$mcJJ$sp specialized = ScalaShapes::plusOne;
+        cases.add(new Case("M13", "specialized Scala SAM after Spark excludes null", Intent.SAFE, specialized, longs, L, false, false));
+        cases.add(new Case("M14", "erased bridge of specialized Scala SAM maps null to zero", Intent.UNSAFE, specialized, longs, L, true, false));
+    }
+
     static List<Case> all() {
         List<Case> cases = new ArrayList<>();
         cases.add(new Case("C01", "single-input fixed-width (LONG->LONG)", Intent.SAFE, new SingleLong(), new DataType[] { L }, L, false, false));
@@ -484,6 +586,7 @@ final class CoverageCorpus {
         cases.add(new Case("U24", "double conversion inside INT->LONG, incompatibleOps off", Intent.UNSAFE, new ArithmeticEffectsTest.FpViaBoxConversion(), new DataType[] { I }, L, false, false));
         cases.add(new Case("U25", "LIST fold over doubles, incompatibleOps off", Intent.UNSAFE, new ListFoldSemanticsTest.DoubleSum(), new DataType[] { listD }, D, false, false));
         addSecondReview(cases);
+        addRecordAndReferenceCases(cases);
         return cases;
     }
 

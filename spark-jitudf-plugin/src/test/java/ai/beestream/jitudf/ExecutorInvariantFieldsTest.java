@@ -380,6 +380,18 @@ class ExecutorInvariantFieldsTest {
     // ============================================================================ tests
 
     @Test
+    void recordConstructorsRunOnTheDeserializingJvm() throws Exception {
+        var worker = new CoverageCorpus.WorkerOffset(9);
+        assertEquals("16", inExecutorJvm(worker, null, 7));
+        assertEquals("84", inExecutorJvm(worker, "77", 7));
+        assertEquals("7", inExecutorJvm(new CoverageCorpus.GuardedMetadata(-1, "label"), "77", 7));
+        var nested = new CoverageCorpus.WithGuard(3, new CoverageCorpus.WorkerGuard(1));
+        assertEquals("10", inExecutorJvm(nested, null, 7));
+        inExecutorJvm(nested, "77", "IllegalStateException: worker guard", 7);
+        assertEquals("7", inExecutorJvm(new CoverageCorpus.Nonnegative(-1), "77", 7));
+    }
+
+    @Test
     void codexReadResolveCounterexampleAcrossTwoJvms() throws Exception {
         assertEquals(null, System.getProperty("review.factor"), "the driver JVM runs without the property");
         ResolvedFactor udf = new ResolvedFactor(9);

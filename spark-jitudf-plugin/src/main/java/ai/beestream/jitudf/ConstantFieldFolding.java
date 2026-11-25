@@ -98,6 +98,11 @@ public final class ConstantFieldFolding {
      * unchanged when there is nothing to fold or the instance is not available (a static lambda).
      */
     public static ResolvedUdf fold(ResolvedUdf udf) {
+        return executorViewProblem(udf.instance()) == null ? foldShippable(udf) : udf;
+    }
+
+    /** The provider has already checked the receiver graph to record its specific refusal reason. */
+    static ResolvedUdf foldShippable(ResolvedUdf udf) {
         Object instance = udf.instance();
         if (instance == null) {
             return udf;
@@ -156,7 +161,7 @@ public final class ConstantFieldFolding {
             }
         }
         try {
-            String problem = serializationProblem(instance);
+            String problem = serializationProblem(instance, false);
             if (problem != null) {
                 return "the UDF's serialization can affect executor behavior: " + problem;
             }
@@ -167,20 +172,28 @@ public final class ConstantFieldFolding {
         }
     }
 
+    /** A CPU bridge projection serializes the already-deserialized closure once more. */
+    static boolean canCloneOnWorker(Object function) {
+        try {
+            return function != null && serializationProblem(function, true) == null;
+        } catch (Exception | LinkageError e) {
+            return false;
+        }
+    }
+
     /**
      * Shipping a CUDA payload bypasses deserialization of the original receiver. Even an unread
      * reference can run a callback (including validation of a cyclic graph) or fail on the worker.
      * Follow the actual default-serialized fields, stopping at primitive data and trusted leaves.
      */
-    private static String serializationProblem(Object instance) throws IllegalAccessException {
+    private static String serializationProblem(Object instance, boolean workerClone) throws ReflectiveOperationException, java.io.IOException {
         var pending = new java.util.ArrayDeque<Object>();
         var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
         pending.add(instance);
         while (!pending.isEmpty()) {
             Object object = pending.remove();
             Class<?> type = object.getClass();
-            if (!seen.add(object) || type == String.class || type == Boolean.class || type == Character.class
-                    || type == Byte.class || type == Short.class || type == Integer.class || type == Long.class || type == Float.class || type == Double.class) {
+            if (!seen.add(object) || immutableStreamValue(object)) {
                 continue;
             }
             if (type.isArray()) {
@@ -193,20 +206,13 @@ public final class ConstantFieldFolding {
                 }
                 continue;
             }
-            String hook = hookThatDecidesFields(type);
-            if (hook != null) {
-                return type.getName() + " uses " + hook;
-            }
-            java.util.List<String> hooks = new java.util.ArrayList<>();
-            for (String[] spec : HOOKS) {
-                if (findHook(type, spec[0], spec[1]) != null) {
-                    hooks.add(spec[0] + spec[1]);
-                }
-            }
-            if (!hooks.isEmpty()) {
-                String why = whyNotDeterministic(type, hooks);
+            // The VM's serializable lambda proxy ships its captured arguments. For CPU
+            // fallback inspect those fields too, even if resolution declined the wrapper.
+            boolean lambda = workerClone && type.isHidden() && type.isSynthetic() && type.getName().contains("$$Lambda");
+            if (!lambda) {
+                String why = callbackProblem(object, workerClone);
                 if (why != null) {
-                    return "cannot establish executor-invariant instance fields or callback behavior: " + why;
+                    return why;
                 }
             }
             for (Class<?> c = type; c != Object.class; c = c.getSuperclass()) {
@@ -236,6 +242,130 @@ public final class ConstantFieldFolding {
             }
         }
         return null;
+    }
+
+    private static boolean immutableStreamValue(Object value) {
+        return value == null || value instanceof String || value instanceof Boolean || value instanceof Character
+                || value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long
+                || value instanceof Float || value instanceof Double;
+    }
+
+    private static String callbackProblem(Object object, boolean workerClone) throws ReflectiveOperationException, java.io.IOException {
+        Class<?> type = object.getClass();
+        String hook = hookThatDecidesFields(type);
+        if (hook != null) {
+            return type.getName() + " uses " + hook;
+        }
+        java.util.List<String> hooks = new java.util.ArrayList<>();
+        for (String[] spec : HOOKS) {
+            if (findHook(type, spec[0], spec[1]) != null) {
+                hooks.add(spec[0] + spec[1]);
+            }
+        }
+        if (!hooks.isEmpty()) {
+            if (workerClone) {
+                // Pure field hooks can still multiply a streamed value on each trip.
+                return "worker cloning would repeat " + hooks;
+            }
+            String why = whyNotDeterministic(type, hooks);
+            if (why != null) {
+                return "cannot establish executor-invariant instance fields or callback behavior: " + why;
+            }
+        }
+        if (type.isRecord()) {
+            String why = recordReconstructionProblem(object, !hooks.isEmpty());
+            if (why != null) {
+                return type.getName() + " record reconstruction: " + why;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * ObjectInputStream invokes a record's canonical constructor with its stream components.
+     * Check every reachable record, even when the UDF never reads it. For a numerical compact
+     * constructor prove purity first, then require this instance's components to be a fixed point.
+     * That makes the result independent of how often Spark ships the closure.
+     */
+    private static String recordReconstructionProblem(Object record, boolean hasHooks) throws ReflectiveOperationException, java.io.IOException {
+        Class<?> type = record.getClass();
+        var components = type.getRecordComponents();
+        Class<?>[] types = java.util.Arrays.stream(components).map(java.lang.reflect.RecordComponent::getType).toArray(Class<?>[]::new);
+        var constructor = type.getDeclaredConstructor(types);
+        String desc = org.objectweb.asm.Type.getConstructorDescriptor(constructor);
+        byte[] bytes = UdfResolver.classFileOf(type);
+        if (bytes == null) {
+            return "cannot inspect canonical constructor";
+        }
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        MethodNode init = node.methods.stream().filter(m -> m.name.equals("<init>") && m.desc.equals(desc)).findFirst().orElseThrow();
+        if (!hasHooks && copiesRecordComponents(init, node.name, components)) {
+            return null;
+        }
+        for (var component : components) {
+            if (!component.getType().isPrimitive()) {
+                Field field = type.getDeclaredField(component.getName());
+                field.setAccessible(true);
+                if (hasHooks || !immutableStreamValue(field.get(record))) {
+                    return "computed constructor with a custom serialization hook or a non-scalar reference component";
+                }
+            }
+        }
+        String why = whyNotDeterministic(type, java.util.List.of("<init>" + desc));
+        if (why != null) {
+            return why;
+        }
+        // Read backing fields directly. User-defined accessors and equals are executable code.
+        // The components are primitive or immutable stream values, and all hooks have been checked.
+        // Include a possible readResolve in the fixed-point check. A pure replacement can
+        // still change k to k+1 on each shipment.
+        Object reconstructed = roundTrip(record);
+        if (reconstructed == null || reconstructed.getClass() != type) {
+            return "record is replaced during deserialization";
+        }
+        for (var component : components) {
+            Field field = type.getDeclaredField(component.getName());
+            field.setAccessible(true);
+            Object before = field.get(record);
+            Object after = field.get(reconstructed);
+            boolean same = switch (before) {
+                case Double v -> after instanceof Double w && Double.doubleToRawLongBits(v) == Double.doubleToRawLongBits(w);
+                case Float v -> after instanceof Float w && Float.floatToRawIntBits(v) == Float.floatToRawIntBits(w);
+                case null -> after == null;
+                default -> before.equals(after);
+            };
+            if (!same) {
+                return "serialization changes component " + field.getName() + " on deserialization";
+            }
+        }
+        return null;
+    }
+
+    private static boolean copiesRecordComponents(MethodNode init, String owner, java.lang.reflect.RecordComponent[] components) {
+        var ops = java.util.Arrays.stream(init.instructions.toArray()).filter(op -> op.getOpcode() >= 0).toList();
+        if (!init.tryCatchBlocks.isEmpty() || ops.size() != 3 + 3 * components.length
+                || !loadsLocal(ops.get(0), Opcodes.ALOAD, 0) || !(ops.get(1) instanceof org.objectweb.asm.tree.MethodInsnNode call)
+                || call.getOpcode() != Opcodes.INVOKESPECIAL || !call.owner.equals("java/lang/Record") || !call.name.equals("<init>")
+                || !call.desc.equals("()V") || ops.getLast().getOpcode() != Opcodes.RETURN) {
+            return false;
+        }
+        int slot = 1;
+        for (int i = 0; i < components.length; i++) {
+            int pos = 2 + 3 * i;
+            var component = org.objectweb.asm.Type.getType(components[i].getType());
+            if (!loadsLocal(ops.get(pos), Opcodes.ALOAD, 0) || !loadsLocal(ops.get(pos + 1), component.getOpcode(Opcodes.ILOAD), slot)
+                    || !(ops.get(pos + 2) instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTFIELD
+                    || !field.owner.equals(owner) || !field.name.equals(components[i].getName()) || !field.desc.equals(component.getDescriptor())) {
+                return false;
+            }
+            slot += component.getSize();
+        }
+        return true;
+    }
+
+    private static boolean loadsLocal(AbstractInsnNode op, int opcode, int slot) {
+        return op instanceof VarInsnNode load && load.getOpcode() == opcode && load.var == slot;
     }
 
     /** A default superclass constructor that only delegates has no executor-specific effects. */
@@ -445,7 +575,7 @@ public final class ConstantFieldFolding {
      * </p>
      */
     static String whyNotDeterministic(Class<?> type, java.util.List<String> hooks) {
-        if (type.getSuperclass() != Object.class) {
+        if (type.getSuperclass() != Object.class && !type.isRecord()) {
             return "the class's state is spread over a class hierarchy";
         }
         byte[] bytes = UdfResolver.classFileOf(type);
@@ -482,7 +612,7 @@ public final class ConstantFieldFolding {
                         }
                         continue;
                     }
-                    if (call.getOpcode() == Opcodes.INVOKESPECIAL && call.name.equals("<init>") && call.owner.equals("java/lang/Object") && call.desc.equals("()V")) {
+                    if (call.getOpcode() == Opcodes.INVOKESPECIAL && call.name.equals("<init>") && call.owner.equals(node.superName) && call.desc.equals("()V")) {
                         continue;
                     }
                     if (STREAM_CALLS.contains(call.owner + "." + call.name + call.desc)) {
@@ -497,7 +627,10 @@ public final class ConstantFieldFolding {
                     if (op == Opcodes.GETSTATIC || op == Opcodes.PUTSTATIC) {
                         return key + " uses the static field " + field.name + ", which each JVM initialises for itself";
                     }
-                    if (!field.owner.equals(node.name) || kindOf(field.desc) == null) {
+                    // Record constructors can copy reference components. Their runtime values
+                    // are checked above, and their reference identity must never decide a field.
+                    boolean recordAssignment = type.isRecord() && method.name.equals("<init>") && op == Opcodes.PUTFIELD;
+                    if (!field.owner.equals(node.name) || (kindOf(field.desc) == null && !recordAssignment)) {
                         return key + " uses the field " + field.name + ", which is not a primitive field of the class";
                     }
                     continue;
@@ -509,7 +642,7 @@ public final class ConstantFieldFolding {
                     return key + " creates or tests " + t.desc.replace('/', '.');
                 }
                 switch (op) {
-                    case Opcodes.INVOKEDYNAMIC, Opcodes.NEWARRAY, Opcodes.ANEWARRAY, Opcodes.MULTIANEWARRAY, Opcodes.MONITORENTER, Opcodes.MONITOREXIT,
+                    case Opcodes.IF_ACMPEQ, Opcodes.IF_ACMPNE, Opcodes.INVOKEDYNAMIC, Opcodes.NEWARRAY, Opcodes.ANEWARRAY, Opcodes.MULTIANEWARRAY, Opcodes.MONITORENTER, Opcodes.MONITOREXIT,
                             Opcodes.IALOAD, Opcodes.LALOAD, Opcodes.FALOAD, Opcodes.DALOAD, Opcodes.AALOAD, Opcodes.BALOAD, Opcodes.CALOAD, Opcodes.SALOAD,
                             Opcodes.IASTORE, Opcodes.LASTORE, Opcodes.FASTORE, Opcodes.DASTORE, Opcodes.AASTORE, Opcodes.BASTORE, Opcodes.CASTORE, Opcodes.SASTORE,
                             Opcodes.ARRAYLENGTH, Opcodes.ATHROW:

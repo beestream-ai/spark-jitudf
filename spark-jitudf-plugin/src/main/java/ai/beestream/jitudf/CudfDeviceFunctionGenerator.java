@@ -21,6 +21,7 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -203,6 +204,9 @@ public final class CudfDeviceFunctionGenerator {
         writer.visit(Opcodes.V21, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER, internalName, null, "java/lang/Object", null);
         emitConstructor(writer);
 
+        if (udf.adapterDescriptor() != null) {
+            prependInputUnboxing(body, udf.adapterDescriptor());
+        }
         retargetOwner(body, source.name, internalName);
         body.accept(writer);
         for (MethodNode helper : helpers) {
@@ -216,6 +220,46 @@ public final class CudfDeviceFunctionGenerator {
         }
         writer.visitEnd();
         return new Generated(internalName.replace('/', '.'), internalName, writer.toByteArray(), body.desc, BOXED_BODY_METHOD, body.desc);
+    }
+
+    /**
+     * TC propagates null for a primitive parameter. Java's erased SAM instead unboxes the
+     * argument before executing even the first instruction of the target. Expose that operation
+     * to TC as ordinary boxed bytecode. Unbox in Java order into separate locals, since
+     * replacing a two-slot primitive with a one-slot box can move later parameters.
+     */
+    private static void prependInputUnboxing(MethodNode body, String descriptor) {
+        Type[] args = Type.getArgumentTypes(descriptor);
+        Type[] target = Type.getArgumentTypes(body.desc);
+        int incomingSlots = java.util.Arrays.stream(args).mapToInt(Type::getSize).sum();
+        java.util.Map<Integer, Integer> referenceSlots = new java.util.HashMap<>();
+        MethodNode prefix = new MethodNode();
+        int from = 0, to = 0;
+        for (int i = 0; i < args.length; i++) {
+            if (target[i].getSort() == Type.OBJECT) {
+                // Keep a boxed argument in its original incoming slot. TC recognizes an
+                // optional input there, but cannot track it through a copied reference local.
+                referenceSlots.put(to, from);
+            } else {
+                prefix.visitVarInsn(args[i].getOpcode(Opcodes.ILOAD), from);
+                if (!args[i].equals(target[i])) {
+                    prefix.visitMethodInsn(Opcodes.INVOKEVIRTUAL, args[i].getInternalName(), target[i].getClassName() + "Value", "()" + target[i].getDescriptor(), false);
+                }
+                prefix.visitVarInsn(target[i].getOpcode(Opcodes.ISTORE), incomingSlots + to);
+            }
+            from += args[i].getSize();
+            to += target[i].getSize();
+        }
+        for (var op : body.instructions) {
+            if (op instanceof org.objectweb.asm.tree.VarInsnNode v) {
+                int slot = incomingSlots + v.var;
+                v.var = v.getOpcode() == Opcodes.ALOAD || v.getOpcode() == Opcodes.ASTORE ? referenceSlots.getOrDefault(v.var, slot) : slot;
+            } else if (op instanceof org.objectweb.asm.tree.IincInsnNode inc) {
+                inc.var += incomingSlots;
+            }
+        }
+        body.instructions.insert(prefix.instructions);
+        body.desc = descriptor;
     }
 
     /**

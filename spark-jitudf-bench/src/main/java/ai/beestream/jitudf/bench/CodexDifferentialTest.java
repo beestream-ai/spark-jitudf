@@ -26,6 +26,7 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
+import org.apache.spark.sql.api.java.UDF3;
 import org.apache.spark.sql.expressions.SparkUserDefinedFunction;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
@@ -353,6 +354,16 @@ public final class CodexDifferentialTest {
         return x + 1;
     }
 
+    public static int twice(int x) { return 2 * x; }
+
+    public static Integer mixed(int x, Integer y) { return y == null ? x : x + y; }
+
+    public static long unused(long first, long second) { return first; }
+
+    public static Long wideMixed(long first, Integer second, long third) { return first + second - third; }
+
+    public static Integer boxed(Integer x) { return x == null ? 42 : 2 * x; }
+
     // ------------------------------------------------------------------------------ the run
 
     public static void main(String[] args) {
@@ -385,6 +396,10 @@ public final class CodexDifferentialTest {
                     seq(scala.Option.apply(Encoders.scalaLong())), scala.Option.apply(Encoders.scalaLong()), scala.Option.apply("plus_one"), false, true));
             Objects.requireNonNull(scalaShape);
 
+            scala.runtime.java8.JFunction1$mcJJ$sp specialized = CodexDifferentialTest::plusOne;
+            spark.udf().register("specialized_boxed", new SparkUserDefinedFunction(specialized, DataTypes.LongType,
+                    seq(scala.Option.apply(Encoders.LONG())), scala.Option.apply(Encoders.LONG()), scala.Option.apply("specialized_boxed"), true, true));
+
             Dataset<Row> base = spark.range(0, rows, 1, 2).selectExpr("id", "id * 7 + 1 as seed");
 
             System.out.println("\n=== Finding 1: UDF resolution ===");
@@ -394,6 +409,10 @@ public final class CodexDifferentialTest {
             spark.conf().set("spark.rapids.sql.udfCompiler.enabled", "false");
             try {
                 expectGpu(spark, "F1 genuine Java UDF behind Spark's adapter", "bitcount", base, "bitcount(seed)", false);
+                Dataset<Row> nullableLong = base.selectExpr("id", "CASE WHEN id % 7 = 3 THEN NULL ELSE seed END AS x");
+                expectFallback(spark, "erased specialized Scala bridge handles null", "specialized_boxed", nullableLong, "specialized_boxed(x)");
+                check("the erased Scala bridge calls plusOne(0) for null", cpuValue(spark, nullableLong,
+                        "specialized_boxed(x)", "coalesce(x, 0L) + 1L"), "");
                 expectFallback(spark, "F1 composed wrapper x -> 1 + inner(x)", "composed", base, "composed(seed)");
                 String reason = TornadoUdfProvider.decisions().getOrDefault("composed", "");
                 check("F1 composed wrapper: declined by the resolver, not by RAPIDS's screen", reason.contains("forward") || reason.contains("adapter"), reason);
@@ -500,6 +519,33 @@ public final class CodexDifferentialTest {
         try {
             System.out.println("\n=== Second review A: dispatch and forwarding ===");
             Dataset<Row> pairs = base.selectExpr("id", "CAST(seed - 50000 AS INT) AS x", "CAST(id % 11 AS INT) AS y");
+            spark.udf().register("primitive_ref", (UDF1<Integer, Integer>) CodexDifferentialTest::twice, DataTypes.IntegerType);
+            spark.udf().register("boxed_ref", (UDF1<Integer, Integer>) CodexDifferentialTest::boxed, DataTypes.IntegerType);
+            spark.udf().register("mixed_ref", (UDF2<Integer, Integer, Integer>) CodexDifferentialTest::mixed, DataTypes.IntegerType);
+            Dataset<Row> nullable = base.selectExpr("id", "CAST(id AS INT) AS v", "CASE WHEN id % 7 = 3 THEN NULL ELSE CAST(id AS INT) END AS n");
+            expectGpu(spark, "static primitive reference over non-null input", "primitive_ref", nullable, "primitive_ref(v)", false);
+            expectGpu(spark, "static boxed reference receives null", "boxed_ref", nullable, "boxed_ref(n)", false);
+            expectGpu(spark, "mixed reference over non-null inputs", "mixed_ref", nullable, "mixed_ref(v,v)", false);
+            spark.udf().register("unused_ref", (UDF2<Long, Long, Long>) CodexDifferentialTest::unused, DataTypes.LongType);
+            spark.udf().register("wide_mixed_ref", (UDF3<Long, Integer, Long, Long>) CodexDifferentialTest::wideMixed, DataTypes.LongType);
+            spark.udf().register("widen_ref", (UDF1<Integer, Long>) CodexDifferentialTest::plusOne, DataTypes.LongType);
+            expectFallback(spark, "Integer unboxes and widens to long", "widen_ref", nullable, "widen_ref(v)");
+            requireNotGpu(spark, "Long is the wrong runtime box for Integer", "widen_ref", nullable, "widen_ref(id)");
+            expectBothFail(spark, "instantiated Integer cast on a Long", "widen_ref", nullable, "widen_ref(id)",
+                    "java.lang.ClassCastException:", "java.lang.ClassCastException:");
+            expectGpu(spark, "wide locals around a boxed argument", "wide_mixed_ref", nullable, "wide_mixed_ref(id,CAST(id % 1000 AS INT),id*3)", false);
+            for (String fn : List.of("primitive_ref", "mixed_ref", "unused_ref")) {
+                String call = switch (fn) {
+                    case "primitive_ref" -> "primitive_ref(n)";
+                    case "mixed_ref" -> "mixed_ref(n,v)";
+                    default -> "unused_ref(id, CAST(n AS BIGINT))";
+                };
+                String errorPlan = planWithoutRunning(spark, nullable, call);
+                check("unboxing takes place on the GPU for " + fn, errorPlan.contains("gpu_" + fn)
+                        && TornadoUdfProvider.decisions().getOrDefault(fn, "").startsWith("TORNADOVM_ELIGIBLE"), errorPlan);
+                expectBothFail(spark, "null-unboxing failure in " + fn, fn, nullable, call, "java.lang.NullPointerException:", "Transform UDF evaluation failed with error `UNKNOWN_ERROR`");
+            }
+            expectGpu(spark, "only the boxed argument receives null", "mixed_ref", nullable, "mixed_ref(v,n)", false);
             expectGpu(spark, "2A inherited call(Integer,Integer) with a call(int,int) overload in the child", "inherited_overload", pairs, "inherited_overload(x, y)", false);
             check("2A the CPU reference is the inherited method (x + 1)", cpuValue(spark, pairs, "inherited_overload(x, y)", "x + 1"), "CPU differs from x + 1");
             expectGpu(spark, "2A inherited implementation, child adds nothing", "inheriting_child", pairs, "inheriting_child(x, y)", false);

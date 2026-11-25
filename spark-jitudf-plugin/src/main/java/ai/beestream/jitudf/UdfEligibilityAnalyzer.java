@@ -714,10 +714,8 @@ public final class UdfEligibilityAnalyzer {
     }
 
     /**
-     * Only a {@code static final} primitive constant of the UDF's own class is readable: its value
-     * is fixed before the kernel is generated, so the kernel sees the number the CPU would. An
-     * instance field is state the kernel has no access to; a mutable static is state that can change
-     * between batches; a field of another class is outside what was analysed at all.
+     * Source-level primitive constant expressions are inlined by javac. A remaining GETSTATIC
+     * can read a value set by the executor's class initializer, even when the field is final.
      */
     private static String checkFieldAccess(FieldInsnNode field, int op, ClassNode classNode) {
         if (op == Opcodes.GETFIELD || op == Opcodes.PUTFIELD) {
@@ -737,7 +735,7 @@ public final class UdfEligibilityAnalyzer {
                 if ((declared.access & Opcodes.ACC_FINAL) == 0) {
                     return "the UDF reads the mutable static field " + field.name + ", whose value can change between batches";
                 }
-                return null;
+                return "the UDF reads static state " + field.name + " at execution time";
             }
         }
         return "the static field " + field.name + " is not declared by the UDF's own class";

@@ -28,17 +28,19 @@ public final class ResolvedUdf {
     private final Class<?> declaringClass;
     private final byte[] classFile;
     private final boolean nullSensitiveAdapter;
+    private final String adapterDescriptor;
 
     public ResolvedUdf(Object instance, Method method, Class<?> declaringClass, byte[] classFile) {
-        this(instance, method, declaringClass, classFile, false);
+        this(instance, method, declaringClass, classFile, false, null);
     }
 
-    private ResolvedUdf(Object instance, Method method, Class<?> declaringClass, byte[] classFile, boolean nullSensitiveAdapter) {
+    private ResolvedUdf(Object instance, Method method, Class<?> declaringClass, byte[] classFile, boolean nullSensitiveAdapter, String adapterDescriptor) {
         this.instance = instance;
         this.method = method;
         this.declaringClass = declaringClass;
         this.classFile = classFile;
         this.nullSensitiveAdapter = nullSensitiveAdapter;
+        this.adapterDescriptor = adapterDescriptor;
     }
 
     /**
@@ -47,7 +49,15 @@ public final class ResolvedUdf {
      * the method itself would not. Such a UDF must not be compiled over a nullable column.
      */
     ResolvedUdf withNullSensitiveAdapter() {
-        return new ResolvedUdf(instance, method, declaringClass, classFile, true);
+        return new ResolvedUdf(instance, method, declaringClass, classFile, true, adapterDescriptor);
+    }
+
+    ResolvedUdf withInputUnboxing(String descriptor) {
+        return new ResolvedUdf(instance, method, declaringClass, classFile, nullSensitiveAdapter, descriptor);
+    }
+
+    String adapterDescriptor() {
+        return adapterDescriptor;
     }
 
     /** Whether a wrapper on the way here treats null differently from the method itself. */
@@ -57,7 +67,7 @@ public final class ResolvedUdf {
 
     /** The same UDF with its class file replaced (by constant folding); everything else carried over. */
     ResolvedUdf withClassFile(byte[] rewritten) {
-        return new ResolvedUdf(instance, method, declaringClass, rewritten, nullSensitiveAdapter);
+        return new ResolvedUdf(instance, method, declaringClass, rewritten, nullSensitiveAdapter, adapterDescriptor);
     }
 
     /** The UDF object, or {@code null} for a static implementation. */

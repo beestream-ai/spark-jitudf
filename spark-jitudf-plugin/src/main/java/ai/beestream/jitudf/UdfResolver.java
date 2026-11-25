@@ -167,6 +167,27 @@ public final class UdfResolver {
         if (!invocation.returnType().isAssignableFrom(implementation.returnType())) {
             throw new Unresolvable("lambda result requires a conversion after the selected implementation");
         }
+        if (lambda.getCapturedArgCount() == 0 && lambda.getImplMethodKind() == MethodHandleInfo.REF_invokeStatic) {
+            var sam = java.lang.invoke.MethodType.fromMethodDescriptorString(lambda.getFunctionalInterfaceMethodSignature(), function.getClass().getClassLoader());
+            var entry = java.lang.invoke.MethodType.methodType(target.method().getReturnType(), parameters);
+            var adapted = entry;
+            for (int i = 0; i < parameters.length; i++) {
+                if (sam.parameterType(i).isPrimitive()) {
+                    // A specialized SAM can implement erased apply(Object) with its own
+                    // conversion (Scala, for example, maps null to zero). Only skip that
+                    // bridge when Spark has already excluded null from the call.
+                    target = target.withNullSensitiveAdapter();
+                } else if (parameters[i].isPrimitive()) {
+                    adapted = adapted.changeParameterType(i, implementation.parameterType(i));
+                }
+            }
+            if (!entry.equals(adapted)) {
+                target = target.withInputUnboxing(adapted.toMethodDescriptorString());
+            }
+            if ((signature.returnType().isPrimitive() || sam.returnType().isPrimitive()) && !target.method().getReturnType().isPrimitive()) {
+                target = target.withNullSensitiveAdapter();
+            }
+        }
         return target;
     }
 
@@ -487,8 +508,8 @@ public final class UdfResolver {
      * Scala's {@code BoxesRunTime.boxToX}) and optionally cast; one {@code invokeinterface} or
      * {@code invokevirtual} on the receiver; the result optionally cast and optionally unboxed by
      * its exact accessor; return. That is what {@code ToScalaUDF} compiles to, what javac emits
-     * for {@code x -> inner.call(x)} with a typed or an erased parameter, and what scalac emits for
-     * {@code (x: Long) => inner.call(x)}. Anything else -- arithmetic, a second call, a reordered,
+     * for {@code x -> inner.call(x)} with a typed or an erased parameter. Scala forwarders that call
+     * {@code Predef} conversion methods fall outside this shape. Anything else -- arithmetic, a second call, a reordered,
      * repeated or dropped argument, a field read -- is a computation of the wrapper's own.
      * </p>
      *

@@ -58,6 +58,20 @@ public final class SeparateExecutorTest {
     private SeparateExecutorTest() {
     }
 
+    public record WorkerOffset(int k) implements UDF1<Integer, Integer> {
+        public WorkerOffset { k = Integer.getInteger("review.factor", k); }
+        public Integer call(Integer x) { return x + k; }
+    }
+
+    public record WorkerSign(boolean negative) implements UDF1<Long, Long> {
+        public WorkerSign { if (Integer.getInteger("review.factor", 9) == 77) negative = !negative; }
+        public Long call(Long x) { return negative ? -x : x; }
+    }
+
+    public record Scale(long k, boolean negate) implements UDF1<Long, Long> {
+        public Long call(Long x) { return negate ? -k * x : k * x; }
+    }
+
     public static final class BitCountUdf implements UDF1<Long, Integer> {
         private static final long serialVersionUID = 1L;
 
@@ -199,7 +213,40 @@ public final class SeparateExecutorTest {
             check("readResolve from the environment is not compiled", !statePlan.contains("gpu_resolved_factor") && statePlan.contains("resolved_factor"), statePlan);
             check("the provider refused it for reading executor-decided state",
                     TornadoUdfProvider.decisions().getOrDefault("resolved_factor", "").contains("instance field"), TornadoUdfProvider.decisions().toString());
-            check("the deterministic writeObject UDF is compiled", statePlan.contains("gpu_written_factor"), statePlan);
+            check("the default fallback avoids cloning the deserialized function", !statePlan.contains("GpuCpuBridge"), statePlan);
+            String writtenPlan = plan(spark, ints, new String[] { "written_factor(x)" });
+            check("the deterministic writeObject UDF is compiled independently", writtenPlan.contains("gpu_written_factor"), writtenPlan);
+
+            spark.udf().register("worker_record", new WorkerOffset(9), DataTypes.IntegerType);
+            spark.udf().register("worker_sign", new WorkerSign(false), DataTypes.LongType);
+            spark.udf().register("scale_11", new Scale(11L, false), DataTypes.LongType);
+            spark.udf().register("scale_42", new Scale(42L, true), DataTypes.LongType);
+            String[] records = { "worker_record(x)", "x + 77", "scale_11(id)", "scale_42(id)", "worker_sign(id)" };
+            List<Row> referenceRecords = run(spark, ints, records, false);
+            List<Row> compiledRecords = run(spark, ints, records, true);
+            check("record values agree with CPU Spark on every row", !referenceRecords.isEmpty() && compiledRecords.equals(referenceRecords), "");
+            check("record constructor uses worker property; stable records keep distinct constants", compiledRecords.stream().allMatch(r ->
+                    r.getInt(1) == r.getInt(2) && r.getLong(3) == r.getLong(0) * 11 && r.getLong(4) == -r.getLong(0) * 42 && r.getLong(5) == -r.getLong(0)), "");
+            String recordPlan = plan(spark, ints, records);
+            check("worker record declines to an original CPU projection", recordPlan.contains("worker_record")
+                    && !recordPlan.contains("gpu_worker_record") && !recordPlan.contains("GpuCpuBridge")
+                    && TornadoUdfProvider.decisions().getOrDefault("worker_record", "").startsWith("TORNADOVM_INELIGIBLE"), recordPlan);
+            String stablePlan = plan(spark, ints, new String[] { "scale_11(id)", "scale_42(id)" });
+            check("both stable records compile with default settings", stablePlan.contains("gpu_scale_11") && stablePlan.contains("gpu_scale_42"), stablePlan);
+
+            String rowBased = "spark.rapids.sql.rowBasedUDF.enabled";
+            String prior = spark.conf().get(rowBased, "false");
+            try {
+                spark.conf().set(rowBased, "true");
+                List<Row> rowBasedRecords = run(spark, ints, records, true);
+                check("the row-based fallback reconstructs records once", rowBasedRecords.equals(referenceRecords), "");
+                String mixedPlan = plan(spark, ints, records);
+                check("row-based worker records and compiled stable siblings in one projection",
+                        mixedPlan.contains("gpu_row_based_worker_record") && mixedPlan.contains("gpu_row_based_worker_sign")
+                                && mixedPlan.contains("gpu_scale_11") && mixedPlan.contains("gpu_scale_42"), mixedPlan);
+            } finally {
+                spark.conf().set(rowBased, prior);
+            }
 
             System.out.println("\n=== a task fails once and is retried ===");
             int before = failedTasks.get();

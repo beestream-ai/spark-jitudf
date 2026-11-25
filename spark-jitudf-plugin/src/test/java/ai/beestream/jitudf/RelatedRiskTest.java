@@ -17,6 +17,7 @@ package ai.beestream.jitudf;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.Serializable;
 
@@ -40,16 +41,18 @@ class RelatedRiskTest {
     }
 
     @Test
-    void primitiveParametersShortCircuitNullsAsSparkDoesAndClinitStateIsRefused() {
+    void erasedInvocationUnboxesNullAndClinitStateIsRefused() {
         TornadoUdfProvider.resetDecisions();
         scala.Function1<Long, Long> scalaShape = (scala.Function1<Long, Long> & Serializable) CoverageCorpus.ScalaShapes::plusOne;
         ProviderHarness.Outcome n = ProviderHarness.cudf(scalaShape, new DataType[] { DataTypes.LongType }, DataTypes.LongType, true, "scalaNullable");
-        // Spark's ScalaUDF returns null without calling the function when a primitive argument is
-        // null (inputPrimitives); TC's null-aware mode compiles exactly that for a primitive parameter.
+        // This provider-only fixture calls the erased Java SAM. The Catalyst primitive
+        // encoder's external null short circuit is exercised through SQL in CodexDifferentialTest.
+        assertThrows(NullPointerException.class, () -> scalaShape.apply(null));
         assertTrue(n.accepted(), n::decision);
-        assertTrue(n.cuda().contains("if (!arg0_opt.has_value()) { *out = cuda::std::nullopt; return 0; }"), n::cuda);
+        assertTrue(n.cuda().contains("if (arg0_valid == 0LL) return 3"), n::cuda);
         ProviderHarness.Outcome c = ProviderHarness.cudf(new ClinitConstant(), new DataType[] { DataTypes.IntegerType }, DataTypes.IntegerType, false, "clinit");
-        // A static final computed in <clinit> is not a compile-time constant; TC refuses to guess it.
+        // A static final computed in <clinit> is not a compile-time constant; the analyzer refuses it before TC.
         assertFalse(c.accepted(), c::decision);
+        assertTrue(c.decision().contains("reads static state K"), c::decision);
     }
 }
