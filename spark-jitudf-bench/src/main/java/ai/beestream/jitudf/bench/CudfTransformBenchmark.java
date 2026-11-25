@@ -45,8 +45,8 @@ import ai.beestream.jitudf.TornadoUdfProvider;
  * convention is therefore pinned without needing their code, and the aggregate is asserted here.</li>
  * <li><b>Murmur3 bucketing.</b> The UDF is checked against Guava's {@code murmur3_32_fixed(0)} on
  * the CPU before any GPU run, so "bit-exact" means bit-exact against the published algorithm.</li>
- * <li><b>Activity bitmap.</b> A representative reconstruction of the one pattern NVIDIA's customer
- * survey called a near-fit. There is no published number to match, so only CPU/GPU agreement is
+ * <li><b>Activity bitmap.</b> A representative packed activity-bitmap pattern (per-day flags in a
+ * {@code long}). There is no published number to match, so only CPU/GPU agreement is
  * asserted.</li>
  * </ul>
  *
@@ -119,7 +119,7 @@ public final class CudfTransformBenchmark {
         }
     }
 
-    /** Active days in a packed bitmap: the near-fit pattern from NVIDIA's customer survey. */
+    /** Active days in a packed bitmap: a representative integer bit-manipulation pattern. */
     public static final class ActiveDaysUdf implements UDF1<Long, Integer> {
         private static final long serialVersionUID = 1L;
 

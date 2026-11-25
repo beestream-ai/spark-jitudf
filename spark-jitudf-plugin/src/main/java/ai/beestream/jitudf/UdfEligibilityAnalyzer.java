@@ -104,7 +104,7 @@ public final class UdfEligibilityAnalyzer {
      *
      * <p>
      * Bit manipulation is not an arbitrary choice of extension. It is what the integer-bitmap UDFs
-     * in NVIDIA's customer survey are made of -- counting set days in a packed {@code long}, shifting
+     * of the packed-bitmap kind are made of -- counting set days in a packed {@code long}, shifting
      * a bitmap by a day -- and what a custom-seed Murmur3 bucketing UDF needs.
      * </p>
      */

@@ -78,7 +78,7 @@ public final class CudfTransformIntegrationTest {
         }
     }
 
-    /** Set bits of a packed activity bitmap: the one near-fit in NVIDIA's customer survey. */
+    /** Set bits of a packed activity bitmap: a representative integer bit-manipulation pattern. */
     public static final class ActiveDaysUdf implements UDF1<Long, Integer> {
         private static final long serialVersionUID = 1L;
 
@@ -110,7 +110,7 @@ public final class CudfTransformIntegrationTest {
         }
     }
 
-    /** The customer near-fit: per-day activity flags packed into an array<bigint>, counted per row. */
+    /** A packed activity bitmap: per-day flags packed into an array<bigint>, counted per row. */
     public static final class ActivityBitmapUdf implements UDF1<scala.collection.Seq<Long>, Integer> {
         private static final long serialVersionUID = 1L;
 

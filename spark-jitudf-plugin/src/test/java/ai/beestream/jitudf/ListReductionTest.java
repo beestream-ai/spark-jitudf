@@ -30,7 +30,7 @@ import org.junit.jupiter.api.Test;
  * A fold over a list column, compiled for cuDF without a segmented transform entry point.
  *
  * <p>
- * The claim under test is that NVIDIA's one near-fit customer pattern -- per-day activity flags
+ * The claim under test is that the packed activity-bitmap pattern -- per-day activity flags
  * packed into an {@code array<bigint>}, counted per row -- is reachable with the shipped cuDF API,
  * by transforming the list's child and reducing over the offsets. Both their review and this
  * project's own analysis had it blocked on new libcudf code.
@@ -38,7 +38,7 @@ import org.junit.jupiter.api.Test;
  */
 class ListReductionTest {
 
-    /** The customer pattern: count set days across a row's packed bitmaps. */
+    /** The activity-bitmap pattern: count set days across a row's packed bitmaps. */
     public static final class ActiveDaysUdf implements UDF1<long[], Integer> {
         @Override
         public Integer call(long[] arr) {

@@ -11,9 +11,11 @@ was verified against the sources and the independent validation of 2026-11-25.
 | [beestream-ai/cudf-spark](https://github.com/beestream-ai/cudf-spark) | `feature/tornadovm-udf-fallback` | `477c7dde10f88c3704414e2fe393dc2bcc702e1a` | `tc-cudf-review-20261125` |
 
 The tags mark the source revisions that were built and validated on both GPUs. Commits after them
-on the same branches change documentation and repository metadata only (README files, the docs in
-this repository, `NOTICE`, the fork's `TORNADOVM_FALLBACK.md` and `upstream-patches/README.md`);
-no Java, Scala, C++, patch or build-script file changes after the tags.
+on the same branches change documentation and repository metadata (README files, the docs in this
+repository, `NOTICE`, the fork's `TORNADOVM_FALLBACK.md` and `upstream-patches/README.md`), plus one
+comment-only rewording in five Java files of this repository. Every compiled class of the plugin,
+its tests and the bench module was verified byte-identical to the tagged revision after that
+change. No Scala, C++, patch or build-script file changes after the tags.
 
 ## Component versions
 

@@ -58,7 +58,7 @@ class CudfDeviceFunctionTest {
         }
     }
 
-    /** Bit intrinsics: NVIDIA's one near-fit customer pattern, an activity bitmap packed in a long. */
+    /** Bit intrinsics: an activity bitmap packed in a long. */
     public static final class ActiveDaysUdf implements UDF1<Long, Integer> {
         @Override
         public Integer call(Long bitmap) {
