@@ -172,8 +172,8 @@ All integer-exact, so every configuration must return identical results:
 |---|---|---|
 | Collatz steps | `CollatzUdf` (data-dependent loop) | `SELECT sum(b_collatz(id + 1)) FROM range(n)`; the 50M aggregate is asserted (8,600,532,084) |
 | Murmur3 bucketing | `BucketUdf`, checked against Guava's `murmur3_32_fixed(0)` before any GPU run | salt-search style bucketing sum |
-| Activity bitmap | `ActiveDaysUdf` over `array<bigint>` (LIST fold) | set-bit count per row |
-| Multi-input | `BlendUdf` | three input columns |
+| Activity bitmap | `ActiveDaysUdf` (`Long.bitCount` of one packed `bigint` per row) | sum of set bits over a hashed `id` |
+| Multi-input | `BlendUdf` (16-round integer mix) | two input columns |
 | Nullable input | `NullDefaultingUdf` | a nullable column |
 
 Collatz and bucketing are reconstructions of experiments described in NVIDIA's evaluation, written
