@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 610" width="1040" height="610" role="img"
+     aria-label="Driver-side TC compilation and cuDF execution. On the Spark driver, at planning time, a registered Java UDF that RAPIDS cannot translate is offered to an eligibility analysis. An eligible UDF is compiled by the TornadoVM TC compiler into a CUDA device function and placed in the GPU plan; a declined UDF keeps RAPIDS' existing CPU fallback. On each executor, the RAPIDS UDF calls the generalized cuDF transform binding once per batch; libcudf compiles the function with NVRTC, caches it, and runs it on cuDF's stream with RMM memory, producing a result column. Executors run no TornadoVM runtime.">
+  <title>spark-jitudf: driver-side TC compilation, executor-side cuDF execution</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3a4250"/>
+    </marker>
+    <marker id="arrow-fb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9a5b13"/>
+    </marker>
+    <style>
+      .lane-title { font: 600 13px "Helvetica Neue", Arial, sans-serif; letter-spacing: .06em; fill: #1d2430; }
+      .lane-sub   { font: 12px "Helvetica Neue", Arial, sans-serif; fill: #5a6372; }
+      .box-title  { font: 600 13.5px "Helvetica Neue", Arial, sans-serif; fill: #1d2430; }
+      .box-text   { font: 12px "Helvetica Neue", Arial, sans-serif; fill: #3a4250; }
+      .mono       { font: 11.5px "SFMono-Regular", Menlo, Consolas, monospace; fill: #3a4250; }
+      .edge       { font: italic 11.5px "Helvetica Neue", Arial, sans-serif; fill: #3a4250; }
+      .fb         { font: 12px "Helvetica Neue", Arial, sans-serif; fill: #7a4710; }
+      .band       { font: 600 12.5px "Helvetica Neue", Arial, sans-serif; fill: #1f5b3a; }
+      .band-text  { font: 12px "Helvetica Neue", Arial, sans-serif; fill: #2d5a40; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1040" height="610" fill="#ffffff"/>
+
+  <!-- ===================== DRIVER LANE ===================== -->
+  <rect x="12" y="12" width="1016" height="250" rx="12" fill="#f3f6fb" stroke="#c9d3e3"/>
+  <text x="30" y="38" class="lane-title">SPARK DRIVER · QUERY PLANNING</text>
+  <text x="290" y="38" class="lane-sub">once per distinct UDF · no GPU needed · result cached</text>
+
+  <!-- 1 registration -->
+  <rect x="30" y="58" width="170" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="44" y="82" class="box-title">Java UDF</text>
+  <text x="44" y="102" class="box-text">ordinary registration</text>
+  <text x="44" y="124" class="mono">spark.udf()</text>
+  <text x="44" y="139" class="mono">  .register(…)</text>
+
+  <!-- 2 RAPIDS planning -->
+  <rect x="232" y="58" width="170" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="246" y="82" class="box-title">RAPIDS planning</text>
+  <text x="246" y="102" class="box-text">UDF not translatable</text>
+  <text x="246" y="118" class="box-text">to Catalyst: offered to</text>
+  <text x="246" y="134" class="box-text">the provider hook</text>
+
+  <!-- 3 eligibility -->
+  <rect x="434" y="58" width="180" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="448" y="82" class="box-title">Eligibility analysis</text>
+  <text x="448" y="102" class="box-text">method Spark dispatches,</text>
+  <text x="448" y="118" class="box-text">captured state, bytecode,</text>
+  <text x="448" y="134" class="box-text">null and error semantics</text>
+
+  <!-- 4 TC -->
+  <rect x="646" y="58" width="170" height="92" rx="8" fill="#e8eefc" stroke="#4a68b5" stroke-width="1.5"/>
+  <text x="660" y="82" class="box-title">TornadoVM TC</text>
+  <text x="660" y="102" class="box-text">compiler (8.2.0), called</text>
+  <text x="660" y="118" class="box-text">directly as a library</text>
+  <text x="660" y="139" class="mono">bytecode → __device__</text>
+
+  <!-- 5 GPU plan -->
+  <rect x="848" y="58" width="164" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="862" y="82" class="box-title">GPU plan</text>
+  <text x="862" y="102" class="mono">gpu_&lt;name&gt;</text>
+  <text x="862" y="120" class="box-text">CUDA source, types,</text>
+  <text x="862" y="136" class="box-text">null / error mode</text>
+
+  <line x1="200" y1="104" x2="230" y2="104" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="402" y1="104" x2="432" y2="104" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="614" y1="104" x2="644" y2="104" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="630" y="52" class="edge" text-anchor="middle">eligible</text>
+  <line x1="816" y1="104" x2="846" y2="104" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- fallback -->
+  <path d="M524,150 L524,196" fill="none" stroke="#9a5b13" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow-fb)"/>
+  <text x="532" y="178" class="fb">declined (with reason)</text>
+  <rect x="300" y="198" width="448" height="48" rx="8" fill="#fdf3e4" stroke="#c98a3a"/>
+  <text x="316" y="218" class="box-title" style="fill:#7a4710">CPU fallback, unchanged</text>
+  <text x="316" y="236" class="fb">RAPIDS CPU bridge or row-based UDF, exactly as RAPIDS plans it today</text>
+
+  <!-- ===================== EXECUTOR LANE ===================== -->
+  <rect x="12" y="316" width="1016" height="280" rx="12" fill="#f4f8f4" stroke="#c4d8c8"/>
+  <text x="30" y="342" class="lane-title">SPARK EXECUTORS · EVERY BATCH</text>
+  <text x="290" y="342" class="lane-sub">RAPIDS and cuDF only</text>
+
+  <!-- e5 RapidsUDF -->
+  <rect x="848" y="360" width="164" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="862" y="384" class="box-title">RAPIDS UDF</text>
+  <text x="862" y="404" class="box-text">evaluateColumnar</text>
+  <text x="862" y="420" class="box-text">on the batch's</text>
+  <text x="862" y="436" class="box-text">input columns</text>
+
+  <!-- e4 JNI -->
+  <rect x="646" y="360" width="170" height="92" rx="8" fill="#e8eefc" stroke="#4a68b5" stroke-width="1.5"/>
+  <text x="660" y="384" class="box-title">Generalized cuDF</text>
+  <text x="660" y="400" class="box-title">transform binding</text>
+  <text x="660" y="420" class="box-text">n inputs, typed output,</text>
+  <text x="660" y="436" class="box-text">null-aware, error channel</text>
+
+  <!-- e3 NVRTC -->
+  <rect x="434" y="360" width="180" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="448" y="384" class="box-title">libcudf transform</text>
+  <text x="448" y="404" class="box-text">NVRTC compiles the</text>
+  <text x="448" y="420" class="box-text">function on first use;</text>
+  <text x="448" y="436" class="box-text">kernel cache on disk</text>
+
+  <!-- e2 kernel -->
+  <rect x="232" y="360" width="170" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="246" y="384" class="box-title">GPU kernel</text>
+  <text x="246" y="404" class="box-text">launched on cuDF's</text>
+  <text x="246" y="420" class="box-text">stream, one thread</text>
+  <text x="246" y="436" class="box-text">per row</text>
+
+  <!-- e1 result -->
+  <rect x="30" y="360" width="170" height="92" rx="8" fill="#ffffff" stroke="#8796ad"/>
+  <text x="44" y="384" class="box-title">Result column</text>
+  <text x="44" y="404" class="box-text">back into the GPU</text>
+  <text x="44" y="420" class="box-text">plan; or a cuDF error</text>
+  <text x="44" y="436" class="box-text">that fails the task</text>
+
+  <line x1="846" y1="406" x2="818" y2="406" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="644" y1="406" x2="616" y2="406" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="432" y1="406" x2="404" y2="406" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="230" y1="406" x2="202" y2="406" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- cuDF ownership band -->
+  <rect x="30" y="474" width="982" height="104" rx="8" fill="#e3f1e7" stroke="#6aa57d"/>
+  <text x="46" y="498" class="band">cuDF / RMM OWN EXECUTION, MEMORY AND STREAMS</text>
+  <text x="46" y="520" class="band-text">Input and output columns are cuDF device buffers allocated through RMM, so RAPIDS' spill and OOM-retry logic</text>
+  <text x="46" y="538" class="band-text">sees every allocation. All work runs on cuDF's stream. NVRTC is the one linked into libcudf; no CUDA toolkit,</text>
+  <text x="46" y="556" class="band-text">TornadoVM runtime or second device-memory owner is present in the executor.</text>
+  <line x1="317" y1="452" x2="317" y2="472" stroke="#6aa57d" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <line x1="524" y1="452" x2="524" y2="472" stroke="#6aa57d" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <line x1="115" y1="452" x2="115" y2="472" stroke="#6aa57d" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <!-- ===================== HAND-OFF ===================== -->
+  <path d="M930,150 L930,357" fill="none" stroke="#3a4250" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="920" y="284" class="edge" text-anchor="end">serialized with the plan: CUDA source,</text>
+  <text x="920" y="300" class="edge" text-anchor="end">no TornadoVM runtime or SDK needed</text>
+
+</svg>

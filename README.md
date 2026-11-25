@@ -30,23 +30,7 @@ is documented case by case in [docs/SUPPORTED_UDFS.md](docs/SUPPORTED_UDFS.md).
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    subgraph Driver["Driver JVM (planning)"]
-        A["spark.udf().register(name, javaUdf, type)<br/>SELECT ... name(col) ..."] --> B["RAPIDS planner<br/>GpuScalaUDFMeta (fork)"]
-        B -->|"no hand-written RapidsUDF and<br/>spark.rapids.sql.tornadovm.enabled=true"| C["TornadoUdfBridge (fork)<br/>calls the provider"]
-        C --> D["TornadoUdfProvider (this repo)<br/>resolve method → serialization/receiver checks<br/>→ fold executor-invariant constants<br/>→ eligibility analysis"]
-        D -->|eligible| E["TC 8.2.0 TcCompiler.compileDeviceFunction<br/>→ CUDA __device__ source"]
-        D -->|declined| F["UDF keeps its CPU path:<br/>Spark CPU Project, RAPIDS CPU bridge,<br/>or row-based UDF if enabled"]
-        E --> G["CudfTransformUdf (a RapidsUDF)<br/>holds CUDA source + types + null/error mode"]
-    end
-    subgraph Executor["Executor JVM (execution)"]
-        G -->|"serialized with the plan"| H["gpu_&lt;name&gt; in the GPU projection"]
-        H --> I["ColumnView.transform(inputs[], src, ..., DType, nullAware, ...)<br/>generalized cuDF JNI binding (fork patch)"]
-        I --> J["libcudf transform_extended<br/>NVRTC JIT, cuDF stream + RMM memory"]
-        J --> K["GPU result column<br/>or cuDF evaluation error"]
-    end
-```
+![Driver-side TC compilation and executor-side cuDF execution](docs/architecture.svg)
 
 | | Driver | Executor |
 |---|---|---|

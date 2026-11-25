@@ -464,8 +464,8 @@ public final class CudfTransformIntegrationTest {
     }
 
     /**
-     * A fold over an array&lt;bigint&gt; column: the pattern NVIDIA's survey called its only near-fit,
-     * and the one this architecture was expected to be unable to run.
+     * A fold over an array&lt;bigint&gt; column: integer bit manipulation over list elements, which a
+     * one-row-in, one-value-out transform cannot express on its own.
      */
     private static void runListCase(SparkSession spark, int rows) {
         System.out.println();
