@@ -1,8 +1,9 @@
 spark-jitudf
 Copyright (c) 2026 Beestream Ltd.
 
-spark-jitudf is licensed under the Apache License, Version 2.0 (see LICENSE). Every source
-file in this repository carries the matching header.
+spark-jitudf is licensed under the Apache License, Version 2.0 (see LICENSE). Every Java
+source file carries the matching header; the build scripts and documentation are covered by the
+same licence.
 
 No third-party source is included here. The build and the evaluation use the material below,
 each fetched from its own project and staying under its own licence.
@@ -21,18 +22,27 @@ each fetched from its own project and staying under its own licence.
    The MovieLens application's 'native' mode loads NVIDIA's published native cosine-similarity
    UDF, from https://github.com/NVIDIA/spark-rapids-examples, reflectively when it is on the class
    path, as the B3 baseline. Nothing of NVIDIA's is compiled or redistributed here; the harness
-   that builds it is in https://github.com/beestream-ai/spark-jitudf-benchmarking.
+   that builds it is kept in Beestream's separate benchmarking repository.
 
 3. TornadoVM, under the Apache License, Version 2.0
 
-   https://github.com/beehive-lab/TornadoVM, used as a released SDK and as the Maven artifacts
-   io.github.beehive-lab:tornado-api and io.github.beehive-lab:tornado-runtime.
+   https://github.com/beehive-lab/TornadoVM, release 8.2.0, used as the Maven artifacts
+   io.github.beehive-lab:tornado-api and io.github.beehive-lab:tornado-runtime (compile-time, and
+   the legacy runtime backend's SDK), and io.github.beehive-lab:tc-runtime, tc-frontend, tc-ir and
+   tc-tornado (the TC compiler), which the build bundles into the shaded
+   spark-jitudf-plugin-*-with-deps.jar.
 
-4. Apache Spark, under the Apache License, Version 2.0
+4. ASM, under the BSD 3-Clause License
+
+   https://asm.ow2.io, org.ow2.asm:asm, asm-tree, asm-analysis and asm-util, bundled into the
+   shaded spark-jitudf-plugin-*-with-deps.jar by the build. Anyone redistributing that jar must
+   carry ASM's licence notice with it.
+
+5. Apache Spark, under the Apache License, Version 2.0
 
    https://spark.apache.org, used as the stock binary distribution, unmodified.
 
-5. The MovieLens 25M data set, under the GroupLens research licence
+6. The MovieLens 25M data set, under the GroupLens research licence
 
    The evaluation prepares its inputs from MovieLens 25M (F. M. Harper and J. A. Konstan,
    "The MovieLens Datasets: History and Context", ACM TiiS 5(4), 2015,

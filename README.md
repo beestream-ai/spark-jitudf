@@ -1,185 +1,152 @@
 # spark-jitudf
 
-**GPU-compiled Spark UDFs, through TornadoVM.**
+**Transparent GPU execution of eligible numerical Java UDFs in the RAPIDS Accelerator for Apache Spark, compiled by TornadoVM's TC compiler and executed by cuDF.**
 
-Runs an ordinary Spark JVM UDF on a GPU, after the RAPIDS `udf-compiler` has declined to translate
-it.
+A Java UDF registered through ordinary Spark APIs (`spark.udf().register(...)`) is normally opaque
+to the RAPIDS Accelerator. When the RAPIDS `udf-compiler` cannot translate it into Catalyst
+expressions (a loop is enough), the UDF runs on the CPU: either through the RAPIDS CPU bridge or,
+if configured, the row-based UDF operator. Either way each batch leaves the GPU.
 
-A UDF containing a loop is the clearest case. RAPIDS builds Catalyst expression trees, and an
-expression tree cannot hold a loop, so the UDF goes to the CPU — even though the arithmetic inside
-it is exactly what a GPU is good at. This project compiles that UDF's **bytecode** into a TornadoVM
-kernel instead, and runs it over the cuDF column buffers **where they already are**: no copy to the
-host, no copy between device buffers, and no TornadoVM array header written into memory libcudf
-owns.
+This project lets RAPIDS offer such a UDF to a provider during planning. If the UDF is inside a
+verified numerical domain, the provider:
 
-The UDF is not rewritten, and the query is not written differently:
+1. resolves the method Spark will actually call,
+2. checks its bytecode against an explicit eligibility analysis,
+3. compiles it **on the driver** with TornadoVM's TC compiler (release 8.2.0, from Maven Central)
+   into a CUDA `__device__` function, and
+4. returns a `RapidsUDF` that carries the CUDA source to the executors. There, cuDF's own
+   `transform` compiles it with NVRTC and runs it over the columns, using cuDF's memory, streams and
+   error reporting.
 
-```java
-spark.udf().register("looped", new LoopUdf(), DataTypes.DoubleType);
-spark.sql("SELECT id, looped(a, b) FROM numbers");   // runs on the GPU
+If any step declines, the UDF keeps the CPU path it would have had anyway. The decision is made per
+UDF, at planning time, before any data is touched.
+
+The executor path uses no TornadoVM runtime and needs no TornadoVM SDK. The shaded plugin jar does
+contain the TC compiler classes, because the same jar is on the driver and executor class paths,
+but executors never invoke them.
+
+Arbitrary Java is **not** supported. The supported domain is fixed-width numerical computation and
+is documented case by case in [docs/SUPPORTED_UDFS.md](docs/SUPPORTED_UDFS.md).
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Driver["Driver JVM (planning)"]
+        A["spark.udf().register(name, javaUdf, type)<br/>SELECT ... name(col) ..."] --> B["RAPIDS planner<br/>GpuScalaUDFMeta (fork)"]
+        B -->|"no hand-written RapidsUDF and<br/>spark.rapids.sql.tornadovm.enabled=true"| C["TornadoUdfBridge (fork)<br/>calls the provider"]
+        C --> D["TornadoUdfProvider (this repo)<br/>resolve method → serialization/receiver checks<br/>→ fold executor-invariant constants<br/>→ eligibility analysis"]
+        D -->|eligible| E["TC 8.2.0 TcCompiler.compileDeviceFunction<br/>→ CUDA __device__ source"]
+        D -->|declined| F["UDF keeps its CPU path:<br/>Spark CPU Project, RAPIDS CPU bridge,<br/>or row-based UDF if enabled"]
+        E --> G["CudfTransformUdf (a RapidsUDF)<br/>holds CUDA source + types + null/error mode"]
+    end
+    subgraph Executor["Executor JVM (execution)"]
+        G -->|"serialized with the plan"| H["gpu_&lt;name&gt; in the GPU projection"]
+        H --> I["ColumnView.transform(inputs[], src, ..., DType, nullAware, ...)<br/>generalized cuDF JNI binding (fork patch)"]
+        I --> J["libcudf transform_extended<br/>NVRTC JIT, cuDF stream + RMM memory"]
+        J --> K["GPU result column<br/>or cuDF evaluation error"]
+    end
 ```
 
-Nothing in the benchmark module calls this project's API, because there is no API to call: a UDF
-reaches the GPU through `spark.udf().register` and the RAPIDS plugin, and Spark itself is
-unmodified.
+| | Driver | Executor |
+|---|---|---|
+| Spark 4.0.4 + patched RAPIDS 26.08.1 distribution | yes | yes |
+| `spark-jitudf-plugin` (shaded; includes TC classes) | yes, used | yes, only `CudfTransformUdf` / `CudfListReductionUdf` are used |
+| TornadoVM runtime or SDK | no | no |
+| CUDA toolkit | no | no (NVRTC is linked into `libcudf.so`) |
+| NVIDIA driver and GPU | yes, for RAPIDS | yes |
 
-## Why
+**Legacy backend.** The repository still contains the earlier *TornadoVM runtime* backend
+(`-Dtornado.spark.backend=tornado-runtime`, the default value of that property for historical
+reasons). It executes TornadoVM kernels inside executors and needs a TornadoVM 8.2.0 SDK on every
+executor. NVIDIA's evaluation advised against running TornadoVM in executors. Everything in this
+README and in the support matrix refers to the **TC/cuDF backend**, selected with
+`-Dtornado.spark.backend=cudf-transform` on the driver.
 
-For a UDF the plugin cannot translate, **turning RAPIDS on can make an application slower than not
-using the GPU at all.** Each batch leaves the GPU, becomes rows, is scored in the JVM, and returns.
-That is the right thing for the plugin to do — correct answers beat refusing — and it is the cost
-this removes.
+## Repositories and versions
 
-The measurements, what separates the figures that can be quoted, and what the evaluation does *not*
-establish are in [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
+| Repository | Role | Branch |
+|---|---|---|
+| [beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf) (this) | The provider (compiler integration), Spark test suites, benchmark and run scripts | `redesign/driver-side-tc-cudf` |
+| [beestream-ai/cudf-spark](https://github.com/beestream-ai/cudf-spark) | Fork of NVIDIA's RAPIDS Accelerator: the planner hook, and the generalized cuDF `transform` JNI patch with its build helper | `feature/tornadovm-udf-fallback` |
 
-## What is here
+Exact source revisions, artifact versions, CUDA classifiers and tested GPUs are in
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
-| Path | |
-|---|---|
-| `spark-jitudf-plugin/` | The module RAPIDS calls into: UDF resolution, eligibility analysis, ASM lowering, kernel generation, cuDF buffer adapters, caches. |
-| `spark-jitudf-bench/` | The runnable end: the end-to-end test, the microbenchmark, the MovieLens application the evaluation measures, the probes, and the UDFs they all use. |
-| `scripts/` | `env.sh` (paths, all overridable), `run-spark.sh` (launcher), `build-rapids-patch.sh`, `build-rapids-reactor.sh`. |
-| [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking) | The benchmark drivers, the correctness checks, the results and the evaluation. |
+## Quick start
 
-## What you need
-
-| | |
-|---|---|
-| GPU | NVIDIA, compute capability 7.0+, 8 GiB or more |
-| Driver | 525 or newer, for CUDA 12 |
-| JDK | 21 |
-| Maven | 3.9 or newer |
-| TornadoVM | **Nothing to install to build.** The compiler the driver uses is `8.2.0-jdk21` on Maven Central, resolved like any other dependency; 8.2.0 is the first release carrying `TcCompiler.compileDeviceFunction`, so earlier versions cannot build the cuDF backend. A `TORNADO_SDK` directory with the CUDA backend is needed **only for the runtime backend** — `sdk install tornadovm 8.2.0-jdk21-cuda`, or [build it](https://tornadovm.readthedocs.io/en/latest/installation.html). The cuDF backend needs no TornadoVM at run time at all. |
-| Spark | 4.0.4, Scala 2.13, the stock binary distribution. Unmodified. |
-| RAPIDS | The released 26.08.1 jar, with the fork's classes patched in (below) |
-
-Only `mvn package` is needed to run the unit tests; everything else is needed to reach a GPU.
-
-## Getting it running
-
-One other repository is needed: [`beestream-ai/cudf-spark`](https://github.com/beestream-ai/cudf-spark)
-on branch `feature/tornadovm-udf-fallback`, a fork of NVIDIA's RAPIDS plugin that makes the UDF
-compiler say *why* it declined a UDF and lets something else try. Without it there is no hook for
-this plugin to be called from, and the released jar will not do.
+Building everything from source takes one long native build (libcudf; about 50 minutes on a
+20-thread laptop, measured with a partly warm ccache) and a few short Java builds. The full procedure,
+including prerequisites and verification, is in [docs/INSTALL.md](docs/INSTALL.md). In outline:
 
 ```bash
-# the three that have no sensible default on another machine
-export JAVA_HOME=/path/to/jdk-21
-export TORNADO_SDK=/path/to/tornadovm/dist/tornadovm-*-cuda   # holds bin/, share/java/tornado
-export SPARK_HOME=/path/to/spark-4.0.4-bin-hadoop3
-
-mkdir -p third_party
-
-# Spark, if you do not have it
-curl -L https://archive.apache.org/dist/spark/spark-4.0.4/spark-4.0.4-bin-hadoop3.tgz \
-  | tar xz -C third_party
-
-# the released RAPIDS jar the fork's classes are patched into
-curl -L -o third_party/rapids-4-spark_2.13-26.08.1.jar \
-  https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.13/26.08.1/rapids-4-spark_2.13-26.08.1.jar
-
-# the fork
-git clone --branch feature/tornadovm-udf-fallback \
-  https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
-
-./scripts/build-rapids-patch.sh     # the fork's changes into the released RAPIDS jar
-mvn package                         # both modules, and the plugin's 81 unit tests
-./scripts/run-spark.sh ai.beestream.jitudf.bench.IntegrationTest
-```
-
-The last command must end `CHECKS: 30, FAILURES: 0`.
-
-### The cuDF `transform` backend
-
-The steps above give you the **runtime backend**, which binds cuDF's buffers and runs a TornadoVM
-kernel over them, and so needs a `TORNADO_SDK` on every JVM that executes a task. The **cuDF
-backend** is the one to look at: it compiles the UDF to a CUDA `__device__` function on the driver
-and hands cuDF a string, so an executor needs nothing of TornadoVM at all.
-
-It needs one more thing — a cuDF JNI with a multi-input, typed-output, null-aware `transform`
-binding. The released one is hard-wired to a single input column and an INT32 result. The binding
-is carried as a patch, with a build script that applies it to NVIDIA's pinned sources:
-
-```bash
-# in the cudf-spark fork cloned above
-third_party/cudf-spark/upstream-patches/build-cudf-spark-jni.sh
-
-# then fold the result into the RAPIDS jar, rather than putting it first on the class path:
-# two jars carrying ai/rapids/cudf plus libcudf.so is an UnsatisfiedLinkError waiting to happen
+git clone -b redesign/driver-side-tc-cudf https://github.com/beestream-ai/spark-jitudf
+git clone -b feature/tornadovm-udf-fallback https://github.com/beestream-ai/cudf-spark spark-jitudf/third_party/cudf-spark
+cd spark-jitudf
+# 1. the generalized cuDF JNI (Docker, CUDA 12.9.1 container, builds for this machine's GPU)
+third_party/cudf-spark/upstream-patches/build-cudf-spark-jni.sh "$PWD/third_party/cudf-spark-jni"
+# 2. Spark 4.0.4 and the released RAPIDS 26.08.1 jar, then the fork's planner classes patched in
+#    (download commands in docs/INSTALL.md)
+./scripts/build-rapids-patch.sh
+# 3. the generalized JNI folded into that distribution, with linkage checks
 ./scripts/swap-cudf-jni.sh
-
-RAPIDS_JAR=third_party/rapids-4-spark_2.13-26.08.1-tornado-jni.jar   ./scripts/run-spark.sh ai.beestream.jitudf.bench.CudfTransformIntegrationTest 200000
+# 4. the provider
+mvn package
 ```
 
-That must end `CHECKS: 78, FAILURES: 0`. It is a long build — around 40 minutes, because it
-compiles libcudf — and it detects your GPU and builds for it. `CUDA_VERSION=13.0.2` builds a
-`cuda13` artifact instead; both classifiers can coexist.
+Then, with the jars from these steps, an existing tested UDF from this repository runs on the GPU
+through ordinary registration (`CollatzUdf` from `CudfTransformIntegrationTest`):
 
-Every path above can be overridden from the environment; `scripts/env.sh` lists them and derives
-the rest from the repository root, so a clone anywhere works without editing anything.
+```bash
+"$SPARK_HOME/bin/spark-shell" --master 'local[2]' \
+  --jars third_party/rapids-4-spark_2.13-26.08.1-tornado-jni.jar,spark-jitudf-plugin/target/spark-jitudf-plugin-0.1.0-SNAPSHOT-with-deps.jar,spark-jitudf-bench/target/spark-jitudf-bench-0.1.0-SNAPSHOT.jar \
+  --driver-java-options '-Dtornado.spark.backend=cudf-transform' \
+  --conf spark.plugins=com.nvidia.spark.SQLPlugin \
+  --conf spark.rapids.sql.tornadovm.enabled=true \
+  --conf spark.rapids.cudfVersionOverride=true \
+  < docs/examples/quickstart.scala
+```
 
-On an SDKMAN install, `tornado --devices` fails with `Module tornado.clblast not found`. That is a
-quirk of that package's own launcher and does not affect anything here: `run-spark.sh` builds its
-own module path and asks only for `tornado.runtime`, `tornado.drivers.common` and
-`tornado.drivers.cuda`. Use `RapidsSmokeTest` below to check your setup instead.
+[`docs/examples/quickstart.scala`](docs/examples/quickstart.scala) (fed to `spark-shell` on
+standard input) registers the UDF, runs `SELECT sum(collatz(id))` on the GPU and on the CPU,
+prints the executed physical plan and the provider's decision, then registers a `String`-returning
+UDF to show the fallback. What matters in the plan is `gpu_collatz(id#…)` in the GPU operators
+(here inside `GpuHashAggregate`), with no `GpuCpuBridge`. The expected output is in
+[docs/INSTALL.md](docs/INSTALL.md#8-run-the-quick-start).
 
-It is **off by default**. Nothing changes until `spark.rapids.sql.tornadovm.enabled=true` is set.
+## Documentation
 
-## Trying it
-
-Each of these is `./scripts/run-spark.sh <class>`. They need the build above; none needs a dataset.
-
-| Class (under `ai.beestream.jitudf.bench`) | What it shows |
+| Document | Contents |
 |---|---|
-| `IntegrationTest` | The whole thing: a UDF with a loop reaching a kernel, a string-returning UDF correctly staying on the CPU, a boolean-returning UDF correctly refused by *this* backend and told which one would take it, an expression RAPIDS already handled keeping its path, and every accelerated value compared row by row against the same UDF on the CPU. Ends `CHECKS: 30, FAILURES: 0`. |
-| `CudfTransformIntegrationTest` | The same idea for the cuDF backend, and wider: 1–5 input columns, INT32/INT64/FLOAT32/FLOAT64/BOOL8 results, nullable columns in and out. Ends `CHECKS: 78, FAILURES: 0`. |
-| `RapidsSmokeTest` | That RAPIDS itself initialises and puts a plain query on the GPU. Run this first if the integration test fails — it separates "RAPIDS is not working here" from "the integration is not working here". |
-| `Benchmark` | End-to-end timings of one query under each configuration, on whatever machine you are on. |
-| `ListStress` | The `ArrayType`/cuDF `LIST` path on its own, at a range of sizes. |
-| `PlanDump` | The executed physical plan, so you can see which operator the UDF became. |
-| `ArrayUdfProbe`, `WrapperProbe` | What Spark actually hands and wraps a Java UDF in. Diagnostics, for when a UDF you wrote is refused. |
-| `AlsProbe` | Whether Spark's own ALS prediction UDF reaches a kernel unmodified. |
+| [docs/INSTALL.md](docs/INSTALL.md) | Prerequisites, step-by-step build of all artifacts, installation into Spark, configuration reference, verification and troubleshooting |
+| [docs/SUPPORTED_UDFS.md](docs/SUPPORTED_UDFS.md) | The supported UDF domain: capability matrix with evidence, null and error semantics, floating-point policy, known coverage gaps |
+| [docs/VALIDATION.md](docs/VALIDATION.md) | Unit tests, provider coverage corpus, Spark differential, cuDF integration, separate-executor and legacy suites; the representative benchmark and its methodology |
+| [COMPATIBILITY.md](COMPATIBILITY.md) | Versions, revisions, classifiers, tested environments |
+| [cudf-spark: TORNADOVM_FALLBACK.md](https://github.com/beestream-ai/cudf-spark/blob/feature/tornadovm-udf-fallback/TORNADOVM_FALLBACK.md) | What the RAPIDS fork changes, and the generalized JNI binding |
 
-To try your own UDF, copy one from `spark-jitudf-bench/src/main/java/ai/beestream/jitudf/bench/udfs/`
-— `LoopUdf` is the simplest — register it, and run a query over it. `TornadoUdfProvider.decisions()`
-then says what was compiled and what was refused, and a refusal names the construct that caused it
-(`LOOP`, `UNSUPPORTED_MATH`, `OBJECT_ACCESS`, and so on). `IntegrationTest` prints that log at the
-end of its run, so it doubles as a worked example of how to read it.
+## Configuration in brief
 
-The `movielens` classes are the measured application; they need the MovieLens 25M dataset, and
-their data preparation and measurement protocol are in
-[spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking).
+| Setting | Where | Default | Effect |
+|---|---|---|---|
+| `spark.rapids.sql.tornadovm.enabled` | Spark conf (fork) | `false` | Offer UDFs RAPIDS cannot run on the GPU to the provider. Off: the fork behaves like the release it was cut from. |
+| `-Dtornado.spark.backend=cudf-transform` | driver JVM system property | `tornado-runtime` | Selects the TC/cuDF backend. Without it the legacy runtime backend is used. |
+| `spark.rapids.sql.tornadovm.provider` | Spark conf (fork) | `ai.beestream.jitudf.TornadoUdfProvider` | Provider class. |
+| `spark.rapids.sql.incompatibleOps.enabled` | Spark conf (RAPIDS) | unset (RAPIDS treats unset as `true`) | Must be set **explicitly** to `true` before the provider compiles any UDF whose reachable code uses floating point; an unset key counts as `false` for the provider. |
+| `spark.rapids.sql.rowBasedUDF.enabled` | Spark conf (RAPIDS) | `false` | Use the row-based UDF operator for declined UDFs, which keeps compiled siblings in the same GPU projection (see the support matrix). |
 
-## What it handles
-
-Fixed-width numeric columns (`int`, `long`, `float`, `double`) in any arity, and `ArrayType`
-columns over the same element types — a cuDF `LIST`, which the kernel reads as offsets plus a
-flattened child, with rows free to differ in length. Loops, branches, `java.lang.Math`, and static
-helper methods in the UDF's own class.
-
-## What it does not do
-
-Nulls, structs, strings, decimals, and anything with state, exceptions or allocation. All of these
-are refused **while planning**, so the query simply keeps the path it already had — a UDF is never
-sent to a kernel on the hope that it will work.
-
-Planning-time refusal is not executor-time fallback: once a plan holds a kernel, a failure during
-execution fails the task.
+The full reference, including RAPIDS settings and diagnostics, is in
+[docs/INSTALL.md](docs/INSTALL.md#configuration-reference).
 
 ## Status
 
-Research code. One application, one dataset, Spark `local` mode. No cluster, multi-GPU or
-production claim. [spark-jitudf-benchmarking](https://github.com/beestream-ai/spark-jitudf-benchmarking) §8 has the full list, including the claims
-that were withdrawn under review.
+A validated engineering prototype for technical review, not a production release. The frozen
+source revisions in [COMPATIBILITY.md](COMPATIBILITY.md) passed independent correctness
+validation on an RTX 4070 (x86-64, SM 8.9, CUDA 12) and an A100 80GB (aarch64, SM 8.0, CUDA 13).
+The evidence covers a curated corpus and test suites, not arbitrary Java. Single-node `local` and
+`local-cluster` Spark masters only; no multi-node cluster, multi-GPU or production claim.
 
 ## License
 
-spark-jitudf is released under the [Apache License, Version 2.0](LICENSE). Copyright (c) 2026
-Beestream Ltd. Every source file carries the matching header.
-
-Nothing third-party is included here; what the build and the evaluation fetch from elsewhere is
-listed in [NOTICE](NOTICE). In particular, the RAPIDS changes this depends on live in
-[`beestream-ai/cudf-spark`](https://github.com/beestream-ai/cudf-spark), stay under that project's
-own Apache 2.0 licence and keep its file headers; nothing here relicenses them, and no file here
-ships in NVIDIA's package namespace.
+Apache License 2.0, see [LICENSE](LICENSE). Copyright (c) 2026 Beestream Ltd. Third-party
+components fetched by the build are listed in [NOTICE](NOTICE). The RAPIDS changes live in the
+cudf-spark fork under NVIDIA's Apache 2.0 licence and file headers.
