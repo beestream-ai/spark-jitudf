@@ -5,17 +5,24 @@ was verified against the sources and the independent validation of 2026-11-25.
 
 ## Source revisions
 
-| Repository | Branch | Independently validated source revision | Tag |
+| Repository | Branch | Validated implementation (tag `tc-cudf-review-20261125`) | Release to build (tag `tc-cudf-release-20261125`) |
 |---|---|---|---|
-| [beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf) | `redesign/driver-side-tc-cudf` | `82d505c547b413c57d84b82db70af4c6c6e8c086` | `tc-cudf-review-20261125` |
-| [beestream-ai/cudf-spark](https://github.com/beestream-ai/cudf-spark) | `feature/tornadovm-udf-fallback` | `477c7dde10f88c3704414e2fe393dc2bcc702e1a` | `tc-cudf-review-20261125` |
+| [beestream-ai/spark-jitudf](https://github.com/beestream-ai/spark-jitudf) | `redesign/driver-side-tc-cudf` | `82d505c547b413c57d84b82db70af4c6c6e8c086` | documentation and tooling on top of it |
+| [beestream-ai/cudf-spark](https://github.com/beestream-ai/cudf-spark) | `feature/tornadovm-udf-fallback` | `477c7dde10f88c3704414e2fe393dc2bcc702e1a` | documentation and tooling on top of it |
 
-The tags mark the source revisions that were built and validated on both GPUs. Commits after them
-on the same branches change documentation and repository metadata (README files, the docs in this
-repository, `NOTICE`, the fork's `TORNADOVM_FALLBACK.md` and `upstream-patches/README.md`), plus one
-comment-only rewording in five Java files of this repository. Every compiled class of the plugin,
-its tests and the bench module was verified byte-identical to the tagged revision after that
-change. No Scala, C++, patch or build-script file changes after the tags.
+`tc-cudf-review-20261125` marks the implementation revisions that were built and validated on both
+GPUs. `tc-cudf-release-20261125` is what the installation guide builds: the same implementation
+plus everything the guide needs. The differences between the two tags are:
+
+* documentation and repository metadata (README files, the docs in this repository, `NOTICE`, the
+  quick-start example, the fork's `TORNADOVM_FALLBACK.md` and `upstream-patches/README.md`);
+* a comment-only rewording in five Java files of this repository. Every compiled class of the
+  plugin, its tests and the bench module is byte-identical to the validated revision;
+* in the fork, `upstream-patches/build-cudf-spark-jni.sh` and its fixture test. The helper now
+  refuses to rewrite a `pom.xml` that holds edits it did not make, and its closing message points to
+  the native test and swap steps. It builds the same sources with the same settings.
+
+No Scala, C++, patch or other script file differs between the tags.
 
 ## Component versions
 

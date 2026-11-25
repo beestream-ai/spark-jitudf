@@ -80,10 +80,11 @@ Building everything from source takes one long native build (libcudf; about 50 m
 including prerequisites and verification, is in [docs/INSTALL.md](docs/INSTALL.md). In outline:
 
 ```bash
-git clone -b redesign/driver-side-tc-cudf https://github.com/beestream-ai/spark-jitudf
-git clone -b feature/tornadovm-udf-fallback https://github.com/beestream-ai/cudf-spark spark-jitudf/third_party/cudf-spark
+git clone --branch tc-cudf-release-20261125 https://github.com/beestream-ai/spark-jitudf
+git clone --branch tc-cudf-release-20261125 https://github.com/beestream-ai/cudf-spark spark-jitudf/third_party/cudf-spark
 cd spark-jitudf
-# 1. the generalized cuDF JNI (Docker, CUDA 12.9.1 container, builds for this machine's GPU)
+# 1. the generalized cuDF JNI (Docker, CUDA 12.9.1 container, builds for this machine's GPU;
+#    tests are run separately, see docs/INSTALL.md §3a)
 third_party/cudf-spark/upstream-patches/build-cudf-spark-jni.sh "$PWD/third_party/cudf-spark-jni"
 # 2. Spark 4.0.4 and the released RAPIDS 26.08.1 jar, then the fork's planner classes patched in
 #    (download commands in docs/INSTALL.md)

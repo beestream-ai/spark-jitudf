@@ -27,15 +27,27 @@ and the RAPIDS Accelerator 26.08.1 distribution.
 
 ## 2. Clone
 
+Clone both repositories at the release tag `tc-cudf-release-20261125`. It contains the
+independently validated implementation together with this documentation, the quick-start example
+and the build tooling used below, so every file the following steps refer to is present:
+
 ```bash
-git clone -b redesign/driver-side-tc-cudf https://github.com/beestream-ai/spark-jitudf
+git clone --branch tc-cudf-release-20261125 https://github.com/beestream-ai/spark-jitudf
 cd spark-jitudf
-git clone -b feature/tornadovm-udf-fallback https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
+git clone --branch tc-cudf-release-20261125 https://github.com/beestream-ai/cudf-spark third_party/cudf-spark
 ```
 
-To build the exact independently validated sources rather than the branch tips, check out the
-revisions listed in [COMPATIBILITY.md](../COMPATIBILITY.md) (`git checkout <sha>` in each clone).
-The branch tips after those revisions contain documentation only.
+(A detached-HEAD notice from `git clone --branch <tag>` is expected.)
+
+**Provenance.** The implementation revisions that were validated on both GPUs are tagged
+`tc-cudf-review-20261125` (see [COMPATIBILITY.md](../COMPATIBILITY.md)). The release tag differs
+from them only in documentation, comment-only edits to five Java files (every compiled class is
+byte-identical), and, in cudf-spark, the JNI build helper's safety checks. To confirm:
+
+```bash
+git diff --stat tc-cudf-review-20261125 tc-cudf-release-20261125
+git -C third_party/cudf-spark diff --stat tc-cudf-review-20261125 tc-cudf-release-20261125
+```
 
 All commands below run from the `spark-jitudf` directory. The scripts read their paths from
 [`scripts/env.sh`](../scripts/env.sh); with the layout used here (everything under
@@ -71,10 +83,38 @@ Options (environment variables): `CUDA_VERSION=13.0.2` builds a `cuda13` artifac
 somewhere other than `~/.m2/repository`. On aarch64 the classifier is `cuda12-arm64` or
 `cuda13-arm64`.
 
-Rerunning it on an existing work directory is safe. It restores only the cuDF files its own patches
-changed, after backing them up, and refuses to touch a submodule with unexpected modifications.
+Use a dedicated work directory for this build (the path given as the first argument), not a
+checkout you also edit by hand. Rerunning the helper on its own work directory is safe:
+
+* it restores only the cuDF files its own patches changed, after backing them up, and refuses to
+  touch a submodule with any other modification;
+* the only tracked file it edits is the work directory's `pom.xml`, and only the project version.
+  It does so only when `pom.xml` is byte-for-byte the pinned revision's file, or already that file
+  with its own version edit. Any other content (a different version, a dependency change) makes it
+  refuse, print the difference and change nothing.
 
 Duration: libcudf dominates. Measured times are in [Verified run](#verified-run).
+
+The helper **builds with `-DskipTests`**: a successful build runs none of the JNI's tests. When it
+finishes it prints the artifact's path and the commands for the next two steps.
+
+### 3a. Run the generalized binding's GPU tests
+
+`TransformMultiTest` (35 tests, added by the patch) exercises the new `transform` binding on the GPU.
+Run it from the JNI work directory with the same CUDA version and Maven repository as the build:
+
+```bash
+cd third_party/cudf-spark-jni
+CUDA_VERSION=12.9.1 LOCAL_MAVEN_REPO=$HOME/.m2/repository \
+  ./build/build-in-docker -Dtest=TransformMultiTest surefire:test
+cd ../..
+```
+
+Expected: `Tests run: 35, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`. Use the
+`CUDA_VERSION` you built with (for example `13.0.2`); `build-in-docker` defaults to 12.9.1.
+
+The exported native entry point is verified in step 6, when the JNI is folded into the
+distribution.
 
 ## 4. Download Spark and the released RAPIDS jar
 
@@ -133,7 +173,9 @@ and refuses the result unless:
   (`ColumnView.transformMulti` with descriptor `([JLjava/lang/String;ZIIZI)J` must be among them).
 
 It finds the JNI jar in `~/.m2/repository/com/nvidia/spark-rapids-jni/26.08.0-tcudf/`; pass the
-jar path as the first argument to use another one. Output:
+jar path as the first argument to use another one (the JNI helper prints the exact command). Use the
+swapped distribution as the only jar carrying `ai.rapids.cudf`; do not add the JNI jar to the class
+path separately. Output:
 `third_party/rapids-4-spark_2.13-26.08.1-tornado-jni.jar` with a `.provenance` file recording the
 SHA-256 of both inputs and the output. `VERIFY_ONLY=1 ./scripts/swap-cudf-jni.sh` re-checks an
 existing output without rewriting it.
